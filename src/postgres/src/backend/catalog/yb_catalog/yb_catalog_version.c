@@ -33,6 +33,7 @@
 #include "nodes/makefuncs.h"
 #include "optimizer/cost.h"
 #include "pg_yb_utils.h"
+#include "storage/lmgr.h"
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -114,10 +115,9 @@ YbMaybeLockMasterCatalogVersion()
 	 * (2) We enable this feature only if the invalidation messages are used and per-database catalog
 	 *		 version mode is enabled.
 	 *
-	 * TODO(#27037): Re-enable table locks check when concurrent DDL is ready.
 	 */
 	if (yb_user_ddls_preempt_auto_analyze &&
-	/* !(*YBCGetGFlags()->enable_object_locking_for_table_locks && enable_object_locking_infra) */
+		YBCIsLegacyModeForCatalogOps() &&
 		YbIsInvalidationMessageEnabled() && YBIsDBCatalogVersionMode())
 	{
 		elog(DEBUG3, "Locking catalog version for db oid %d", MyDatabaseId);
@@ -212,6 +212,18 @@ YbCallSQLIncrementCatalogVersions(Oid functionId, bool is_breaking_change,
 	PG_END_TRY();
 }
 
+/*
+ * When transactional DDL is enabled, multiple DDLs could contribute to the
+ * catalog version increment. Hence, we need to be more explicit that we
+ * are only logging the last catalog version incrementing DDL and there may
+ * be more such DDLs that are not logged.
+ */
+static bool
+LastDdlInTransactionBlock()
+{
+	return YBIsDdlTransactionBlockEnabled() && IsTransactionBlock();
+}
+
 static void
 MaybeLogNewSQLIncrementCatalogVersion(bool success,
 									  Oid db_oid,
@@ -243,8 +255,10 @@ MaybeLogNewSQLIncrementCatalogVersion(bool success,
 						"(%sbreaking) with inval messages%s%s",
 						__func__, action, is_breaking_change ? "" : "non",
 						tmpbuf1, tmpbuf2),
-				 errdetail("Local version: %" PRIu64 ", node tag: %s.",
-						   YbGetCatalogCacheVersion(), command_tag ? command_tag : "n/a"),
+				 errdetail("Local version: %" PRIu64 ", %snode tag: %s.",
+						   YbGetCatalogCacheVersion(),
+						   LastDdlInTransactionBlock() ? "last ddl " : "",
+						   command_tag ? command_tag : "n/a"),
 				 errhidestmt(!log_ysql_catalog_versions),
 				 errhidecontext(!log_ysql_catalog_versions)));
 	}
@@ -431,6 +445,9 @@ YbIncrementMasterDBCatalogVersionTableEntryImpl(Oid db_oid,
 {
 	Assert(YbGetCatalogVersionType() == CATALOG_VERSION_CATALOG_TABLE);
 
+	if (!YBCIsLegacyModeForCatalogOps())
+		LockRelationOid(YBCatalogVersionRelationId, ExclusiveLock);
+
 	if (YbIsInvalidationMessageEnabled())
 	{
 		Oid			func_oid = is_global_ddl ? YbGetNewIncrementAllCatalogVersionsFunctionOid()
@@ -438,6 +455,9 @@ YbIncrementMasterDBCatalogVersionTableEntryImpl(Oid db_oid,
 
 		if (OidIsValid(func_oid) && YbInvalidationMessagesTableExists())
 		{
+			if (!YBCIsLegacyModeForCatalogOps())
+				LockRelationOid(YbInvalidationMessagesRelationId, ExclusiveLock);
+
 			bool		is_null = false;
 			Datum		messages = GetInvalidationMessages(invalMessages, nmsgs, &is_null);
 			int			expiration_secs = yb_invalidation_message_expiration_secs;
@@ -604,8 +624,10 @@ YbIncrementMasterDBCatalogVersionTableEntryImpl(Oid db_oid,
 		ereport(LOG,
 				(errmsg("%s: incrementing master catalog version (%sbreaking)%s",
 						__func__, is_breaking_change ? "" : "non", tmpbuf),
-				 errdetail("Local version: %" PRIu64 ", node tag: %s.",
-						   YbGetCatalogCacheVersion(), command_tag ? command_tag : "n/a"),
+				 errdetail("Local version: %" PRIu64 ", %snode tag: %s.",
+						   YbGetCatalogCacheVersion(),
+						   LastDdlInTransactionBlock() ? "last ddl " : "",
+						   command_tag ? command_tag : "n/a"),
 				 errhidestmt(!log_ysql_catalog_versions),
 				 errhidecontext(!log_ysql_catalog_versions)));
 	}
@@ -638,6 +660,7 @@ YbIncrementMasterCatalogVersionTableEntry(bool is_breaking_change,
 										  const SharedInvalidationMessage *invalMessages,
 										  int nmsgs)
 {
+	elog(DEBUG2, "YbIncrementMasterCatalogVersionTableEntry");
 	YbResetNewCatalogVersion();
 	if (YbGetCatalogVersionType() != CATALOG_VERSION_CATALOG_TABLE)
 		return false;

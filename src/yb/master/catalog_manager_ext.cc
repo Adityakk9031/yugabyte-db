@@ -66,6 +66,7 @@
 #include "yb/master/tablet_split_manager.h"
 #include "yb/master/ts_manager.h"
 #include "yb/master/xcluster_consumer_registry_service.h"
+#include "yb/master/ysql_ddl_verification_task.h"
 #include "yb/master/ysql/ysql_manager_if.h"
 #include "yb/master/ysql_tablegroup_manager.h"
 
@@ -707,6 +708,29 @@ Status CatalogManager::RepackSnapshotsForBackup(
             }
           }
           pg_schema_name_to_set = pg_schema_name;
+
+          // Repair schema version skew between the snapshotted SysTablesEntryPB and the current
+          // in-memory state. The snapshot coordinator may have captured an older schema version
+          // for the table while tablets later advanced to a newer version due to an ALTER TABLE
+          // that raced with CREATE_ON_TABLET snapshot operations. At restore time, we rely on
+          // the invariant that the latest schema version in the snapshot is at least as large as
+          // the schema versions persisted on tablets. To restore this invariant for backups, if
+          // the in-memory schema version is greater than the snapshotted version, override the
+          // version fields in the snapshotted SysTablesEntryPB.
+          SysTablesEntryPB snapshotted_table_pb =
+              VERIFY_RESULT(ParseFromSlice<SysTablesEntryPB>(entry.data()));
+          const auto current_version = l->pb.version();
+          const auto snapshotted_version = snapshotted_table_pb.version();
+          if (current_version > snapshotted_version) {
+            LOG(INFO) << Format(
+                "Overriding snapshotted schema version for table $0 from $1 to $2 "
+                "during snapshot repack for backup",
+                table_info->id(), snapshotted_version, current_version);
+            snapshotted_table_pb.set_version(current_version);
+            std::string serialized;
+            snapshotted_table_pb.AppendToString(&serialized);
+            entry.set_data(serialized);
+          }
         }
       } else if (!tables_to_skip.empty() && entry.type() == SysRowEntryType::TABLET) {
         // Note: Ordering here is important, we expect tablet entries only after their table entry.
@@ -990,6 +1014,12 @@ Status CatalogManager::ImportSnapshotPreprocess(
           if (data.old_table_id.empty()) {
             data.old_table_id = entry.id();
             data.table_entry_pb = VERIFY_RESULT(ParseFromSlice<SysTablesEntryPB>(entry.data()));
+            // Mark tables undergoing DDL at backup time to skip schema validation at import.
+            if (data.table_entry_pb.ysql_ddl_txn_verifier_state_size() > 0) {
+            data.validate_schema = false;
+            LOG_WITH_FUNC(INFO) << "Marking table " << data.old_table_id
+                                << " to skip schema validation due to DDL verifier state.";
+            }
             if (backup_entry.has_pg_schema_name()) {
               data.pg_schema_name = backup_entry.pg_schema_name();
             }
@@ -1342,7 +1372,7 @@ Result<SnapshotInfoPB> CatalogManager::GetSnapshotInfoForBackup(const TxnSnapsho
   return snapshot_info;
 }
 
-Result<std::pair<SnapshotInfoPB, std::unordered_set<TabletId>>>
+Result<CatalogManagerIf::CloneSnapshotInfo>
 CatalogManager::GenerateSnapshotInfoFromScheduleForClone(
     const SnapshotScheduleId& snapshot_schedule_id, HybridTime read_time,
     CoarseTimePoint deadline) {
@@ -1384,8 +1414,9 @@ CatalogManager::GenerateSnapshotInfoFromScheduleForClone(
   snapshot_info.mutable_entry()->clear_previous_snapshot_hybrid_time();
 
   // Set backup_entries based on what entries were running in the sys catalog as of read_time.
-  *snapshot_info.mutable_backup_entries() = VERIFY_RESULT(
+  auto backup_entries = VERIFY_RESULT(
       GetBackupEntriesAsOfTime(snapshot_id, source_ns_id, read_time));
+  *snapshot_info.mutable_backup_entries() = std::move(backup_entries.backup_entries);
   VLOG_WITH_FUNC(1) << Format("snapshot_info returned: $0", snapshot_info.ShortDebugString());
 
   // Compute the set of tablets that were running as of read_time but were not snapshotted because
@@ -1397,10 +1428,13 @@ CatalogManager::GenerateSnapshotInfoFromScheduleForClone(
       not_snapshotted_tablets.insert(backup_entry.entry().id());
     }
   }
-  return std::make_pair(std::move(snapshot_info), std::move(not_snapshotted_tablets));
+  return CatalogManagerIf::CloneSnapshotInfo{
+      std::move(snapshot_info),
+      std::move(not_snapshotted_tablets),
+      std::move(backup_entries.replication_info_and_num_tablets)};
 }
 
-Result<RepeatedPtrField<BackupRowEntryPB>> CatalogManager::GetBackupEntriesAsOfTime(
+Result<CatalogManager::BackupEntriesAndTabletLimitInfo> CatalogManager::GetBackupEntriesAsOfTime(
     const TxnSnapshotId& snapshot_id, const NamespaceId& source_ns_id, HybridTime read_time) {
   // Open a temporary on-the-side DocDB for the sys.catalog using the data files of snapshot_id and
   // read sys.catalog data as of export_time to get the list of tablets that were running at that
@@ -1500,7 +1534,7 @@ Result<RepeatedPtrField<BackupRowEntryPB>> CatalogManager::GetBackupEntriesAsOfT
         // We always clone the set of active children as of the snapshot time. If tablet splits
         // occurred between the restore time and snapshot time, this means we will have more
         // children after the clone than were present at clone time, but:
-        // 1. The children still contain the correct data because history retention is preserved
+        // 1. The children still contain the correct data because history retention is preserved.
         // 2. This allows us to clone from a snapshot instead of active rocksdb (like we do for
         //    cloning deleted tables), which is safer because it is more targeted.
         // Ignore DELETED / REPLACED tablets since they would otherwise cause partition conflicts
@@ -1517,8 +1551,17 @@ Result<RepeatedPtrField<BackupRowEntryPB>> CatalogManager::GetBackupEntriesAsOfT
       }));
   // Order SysTabletsEntries in each SysTableEntry by partition start_key as CreateTable relies on
   // the order of tablets.
-  for (auto& sys_table_entry : tables_to_tablets) {
-    sys_table_entry.second.OrderTabletsByPartitions();
+  std::vector<std::pair<ReplicationInfoPB, int>> replication_info_and_num_tablets;
+  for (auto& [table_id, table_with_tablets] : tables_to_tablets) {
+    table_with_tablets.OrderTabletsByPartitions();
+    // Populate the replication info for the tablet limit pre-checks.
+    auto table_ptr = GetTableInfo(table_id);
+    if (!table_ptr) {
+      return STATUS_FORMAT(NotFound, "Failed to get table info for table $0", table_id);
+    }
+    replication_info_and_num_tablets.push_back({
+        VERIFY_RESULT(GetTableReplicationInfo(table_ptr)),
+        table_with_tablets.tablets_entries.size()});
   }
   // Populate the backup_entries with SysTablesEntry and SysTabletsEntry.
   // Start with the colocation_parent_table_id if the database is colocated.
@@ -1533,7 +1576,8 @@ Result<RepeatedPtrField<BackupRowEntryPB>> CatalogManager::GetBackupEntriesAsOfT
   for (auto& sys_table_entry : tables_to_tablets) {
     sys_table_entry.second.AddToBackupEntries(sys_table_entry.first, backup_entries);
   }
-  return backup_entries;
+  return BackupEntriesAndTabletLimitInfo{
+      std::move(backup_entries), std::move(replication_info_and_num_tablets)};
 }
 
 Status CatalogManager::GetFullUniverseKeyRegistry(const GetFullUniverseKeyRegistryRequestPB* req,
@@ -2264,9 +2308,10 @@ Status CatalogManager::ImportTableEntry(
     // Additionally, for indexes, we compare the column ids as we expect them to be
     // preserved.
     const vector<ColumnId>& column_ids = schema.column_ids();
-    if (!persisted_schema.Equals(schema, comparator)
-        || persisted_schema.column_ids().size() != column_ids.size()
-        || (table->is_index() && persisted_schema.column_ids() != column_ids)) {
+    if (table_data->validate_schema &&
+        (!persisted_schema.Equals(schema, comparator) ||
+         persisted_schema.column_ids().size() != column_ids.size() ||
+         (table->is_index() && persisted_schema.column_ids() != column_ids))) {
       const string msg = Format(
           "Invalid created $0 table '$1' in namespace id $2: schema={$3}, expected={$4}",
           TableType_Name(meta.table_type()), meta.name(), new_namespace_id,
@@ -2402,10 +2447,16 @@ Status CatalogManager::ImportTableEntry(
     // 1- Clone case: bump it to current schema version of source table + 1. This ensures that the
     // current schema version is greater than all schema versions that might exist in the snapshot
     // used for clone.
-    // 2- Restoring a backup case: bump the schema version to the schema version of SysTableEntryPB
-    // found in the snapshotInfo if the latter is greater. This is because it is guaranteed that the
-    // schema version found in snapshotInfo is the maximum schema version that can be found in the
-    // snapshot at backup creation time.
+    // 2- Restoring a backup case: bump the schema version to 1 + the schema version of
+    // SysTableEntryPB found in the SnapshotInfoPB if the latter is greater. This is because it is
+    // guaranteed that the schema version found in snapshotInfo is the maximum schema version that
+    // can be found in the snapshot at backup creation time. The one extra schema version bump is
+    // used to avoid any conflict with the snapshot's older schema packings at tserver side.
+    // The last version is used for the committed schema on the master of the restore side
+    // The semantics are as follows: At tserver, all schema packings coming from the snapshot
+    // will be used in tablet-meta and the last schema will have the correct committed schema
+    // created at restore side as part of executing the SQL dump. The last schema is send from the
+    // master to the tservers during ImportSnapshot.
     if (is_clone) {
       // The Source table should be found as we are cloning from it.
       TRACE("Looking up source table");
@@ -2421,8 +2472,8 @@ Status CatalogManager::ImportTableEntry(
       } else {
         schema_version = source_table_lock->pb.version() + 1;
       }
-    } else if (meta.version() > table->LockForRead()->pb.version()) {
-      schema_version = meta.version();
+    } else if (meta.version() >= table->LockForRead()->pb.version()) {
+      schema_version = meta.version() + 1;
     }
 
     if (schema_version) {

@@ -26,11 +26,13 @@ import com.yugabyte.yw.common.operator.KubernetesResourceDetails;
 import com.yugabyte.yw.common.operator.OperatorStatusUpdater;
 import com.yugabyte.yw.common.operator.YBUniverseReconciler;
 import com.yugabyte.yw.common.operator.helpers.KubernetesOverridesSerializer;
+import com.yugabyte.yw.common.operator.helpers.OperatorPlacementInfoHelper;
 import com.yugabyte.yw.common.services.YBClientService;
 import com.yugabyte.yw.common.utils.Pair;
 import com.yugabyte.yw.forms.BackupRequestParams;
 import com.yugabyte.yw.forms.BackupRequestParams.KeyspaceTable;
 import com.yugabyte.yw.forms.BackupTableParams;
+import com.yugabyte.yw.forms.CreatePitrConfigParams;
 import com.yugabyte.yw.forms.DrConfigCreateForm;
 import com.yugabyte.yw.forms.DrConfigSetDatabasesForm;
 import com.yugabyte.yw.forms.KubernetesGFlagsUpgradeParams;
@@ -40,6 +42,7 @@ import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ExposingServiceState;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
+import com.yugabyte.yw.forms.UpdatePitrConfigParams;
 import com.yugabyte.yw.forms.XClusterConfigCreateFormData.BootstrapParams;
 import com.yugabyte.yw.forms.XClusterConfigRestartFormData.RestartBootstrapParams;
 import com.yugabyte.yw.forms.YbcThrottleParametersResponse;
@@ -84,6 +87,7 @@ import io.yugabyte.operator.v1alpha1.BackupScheduleSpec;
 import io.yugabyte.operator.v1alpha1.BackupSpec;
 import io.yugabyte.operator.v1alpha1.BackupStatus;
 import io.yugabyte.operator.v1alpha1.DrConfig;
+import io.yugabyte.operator.v1alpha1.PitrConfig;
 import io.yugabyte.operator.v1alpha1.Release;
 import io.yugabyte.operator.v1alpha1.ReleaseSpec;
 import io.yugabyte.operator.v1alpha1.StorageConfig;
@@ -337,14 +341,58 @@ public class OperatorUtils {
 
   /*--- YBUniverse related help methods ---*/
 
-  public boolean shouldUpdateYbUniverse(
-      UserIntent currentUserIntent,
-      int newNumNodes,
-      DeviceInfo newDeviceInfo,
-      DeviceInfo newMasterDeviceInfo) {
+  public boolean shouldUpdatePrimaryCluster(Cluster currentCluster, YBUniverse newYbUniverse) {
+    UserIntent currentUserIntent = currentCluster.userIntent;
+    int newNumNodes = newYbUniverse.getSpec().getNumNodes().intValue();
+    DeviceInfo newDeviceInfo = mapDeviceInfo(newYbUniverse.getSpec().getDeviceInfo());
+    DeviceInfo newMasterDeviceInfo =
+        mapMasterDeviceInfo(newYbUniverse.getSpec().getMasterDeviceInfo());
     return !(currentUserIntent.numNodes == newNumNodes)
-        || !currentUserIntent.deviceInfo.volumeSize.equals(newDeviceInfo.volumeSize)
-        || !currentUserIntent.masterDeviceInfo.volumeSize.equals(newMasterDeviceInfo.volumeSize);
+        || checkifDeviceInfoChanged(
+            currentUserIntent.deviceInfo, newDeviceInfo.volumeSize.intValue())
+        || checkifDeviceInfoChanged(
+            currentUserIntent.masterDeviceInfo, newMasterDeviceInfo.volumeSize.intValue())
+        || OperatorPlacementInfoHelper.checkIfPlacementInfoChanged(
+            currentCluster.placementInfo, newYbUniverse, false);
+  }
+
+  public boolean shouldAddReadReplica(Universe universe, YBUniverse ybUniverse) {
+    int readReplicaClusterCount = universe.getUniverseDetails().getReadOnlyClusters().size();
+    boolean hasReadReplica = ybUniverse.getSpec().getReadReplica() != null;
+    return readReplicaClusterCount == 0 && hasReadReplica;
+  }
+
+  public boolean shouldRemoveReadReplica(Universe universe, YBUniverse ybUniverse) {
+    int readReplicaClusterCount = universe.getUniverseDetails().getReadOnlyClusters().size();
+    boolean hasReadReplica = ybUniverse.getSpec().getReadReplica() != null;
+    return readReplicaClusterCount > 0 && !hasReadReplica;
+  }
+
+  public boolean shouldUpdateReadReplica(Universe universe, YBUniverse ybUniverse) {
+    int readReplicaClusterCount = universe.getUniverseDetails().getReadOnlyClusters().size();
+    boolean hasReadReplica = ybUniverse.getSpec().getReadReplica() != null;
+    // No read replica exists or none requested
+    if (readReplicaClusterCount == 0 || !hasReadReplica) {
+      return false;
+    } else {
+      UserIntent readReplicaUserIntent =
+          universe.getUniverseDetails().getReadOnlyClusters().get(0).userIntent;
+      PlacementInfo readReplicaPlacementInfo =
+          universe.getUniverseDetails().getReadOnlyClusters().get(0).placementInfo;
+      return readReplicaUserIntent.numNodes
+              != ybUniverse.getSpec().getReadReplica().getNumNodes().intValue()
+          || readReplicaUserIntent.replicationFactor
+              != ybUniverse.getSpec().getReadReplica().getReplicationFactor().intValue()
+          || OperatorPlacementInfoHelper.checkIfPlacementInfoChanged(
+              readReplicaPlacementInfo, ybUniverse, true)
+          || checkifDeviceInfoChanged(
+              readReplicaUserIntent.deviceInfo,
+              ybUniverse.getSpec().getReadReplica().getDeviceInfo().getVolumeSize().intValue());
+    }
+  }
+
+  public boolean checkifDeviceInfoChanged(DeviceInfo oldDeviceInfo, int newVolumeSize) {
+    return !oldDeviceInfo.volumeSize.equals(newVolumeSize);
   }
 
   public String getKubernetesOverridesString(Object kubernetesOverrides) {
@@ -424,52 +472,6 @@ public class OperatorUtils {
       }
     }
     return specificGFlags;
-  }
-
-  public boolean checkIfPlacementInfoChanged(
-      PlacementInfo oldPlacementInfo, YBUniverse ybUniverse) {
-    // If placement info is not set in the CR, return false
-    if (ybUniverse.getSpec().getPlacementInfo() == null) {
-      return false;
-    }
-    JsonNode oldPlacementCloud = objectMapper.valueToTree(oldPlacementInfo.cloudList.get(0));
-    JsonNode newPlacementCloud = objectMapper.valueToTree(ybUniverse.getSpec().getPlacementInfo());
-
-    Map<String, JsonNode> oldRegions = mapByCode(oldPlacementCloud.path("regionList"));
-    Map<String, JsonNode> newRegions = mapByCode(newPlacementCloud.path("regions"));
-
-    // Detect region changes
-    if (!oldRegions.keySet().equals(newRegions.keySet())) {
-      log.info("region mismatch for universe: {}", ybUniverse.getMetadata().getName());
-      return true;
-    }
-
-    // For each region, compare zones
-    for (String region : oldRegions.keySet()) {
-      // Need to map by name for zones
-      Map<String, JsonNode> oldZones = mapByName(oldRegions.get(region).path("azList"));
-      Map<String, JsonNode> newZones = mapByCode(newRegions.get(region).path("zones"));
-
-      if (!oldZones.keySet().equals(newZones.keySet())) {
-        log.info("az list mismatch for universe: {}", ybUniverse.getMetadata().getName());
-        return true;
-      }
-
-      // Compare zone fields
-      for (String zone : oldZones.keySet()) {
-        JsonNode oldZone = oldZones.get(zone);
-        JsonNode newZone = newZones.get(zone);
-
-        if (oldZone.path("numNodesInAZ").asInt(-1) != newZone.path("numNodes").asInt(-1)) {
-          return true;
-        }
-        if (oldZone.path("isAffinitized").asBoolean(false)
-            != newZone.path("preferred").asBoolean(false)) {
-          return true;
-        }
-      }
-    }
-    return false; // no changes
   }
 
   private static Map<String, JsonNode> mapByCode(JsonNode array) {
@@ -580,11 +582,8 @@ public class OperatorUtils {
         case EditKubernetesUniverse:
           UniverseDefinitionTaskParams prevTaskParams =
               Json.fromJson(prevTaskToRerun.getTaskParams(), UniverseDefinitionTaskParams.class);
-          return shouldUpdateYbUniverse(
-              prevTaskParams.getPrimaryCluster().userIntent,
-              incomingNumNodes,
-              incomingDeviceInfo,
-              incomingMasterDeviceInfo);
+          return shouldUpdatePrimaryCluster(u.getUniverseDetails().getPrimaryCluster(), ybUniverse)
+              || shouldUpdateReadReplica(u, ybUniverse);
         case KubernetesOverridesUpgrade:
           KubernetesOverridesUpgradeParams overridesUpgradeTaskParams =
               Json.fromJson(
@@ -617,14 +616,13 @@ public class OperatorUtils {
     log.trace("gflags mismatch: {}", mismatch);
     mismatch =
         mismatch
-            || checkIfPlacementInfoChanged(
-                u.getUniverseDetails().getPrimaryCluster().placementInfo, ybUniverse);
-    log.trace("placement info mismatch: {}", mismatch);
+            || shouldUpdatePrimaryCluster(u.getUniverseDetails().getPrimaryCluster(), ybUniverse);
+    log.trace("primary cluster mismatch: {}", mismatch);
     mismatch =
-        mismatch
-            || shouldUpdateYbUniverse(
-                currentUserIntent, incomingNumNodes, incomingDeviceInfo, incomingMasterDeviceInfo);
-    log.trace("nodes mismatch: {}", mismatch);
+        mismatch || shouldAddReadReplica(u, ybUniverse) || shouldRemoveReadReplica(u, ybUniverse);
+    log.trace("read replica count mismatch: {}", mismatch);
+    mismatch = mismatch || shouldUpdateReadReplica(u, ybUniverse);
+    log.trace("read replica mismatch: {}", mismatch);
     mismatch =
         mismatch
             || !StringUtils.equals(currentUserIntent.ybSoftwareVersion, incomingYbSoftwareVersion);
@@ -1735,5 +1733,54 @@ public class OperatorUtils {
       log.warn("Unable to get YSQL service endpoints", e);
     }
     return endpoints;
+  }
+
+  public CreatePitrConfigParams getCreatePitrConfigParamsFromCr(PitrConfig pitrConfig)
+      throws Exception {
+
+    ObjectNode crParams = objectMapper.valueToTree(pitrConfig.getSpec());
+    Customer cust = getOperatorCustomer();
+    String crUniverseName = crParams.get("universe").asText();
+    Universe universe = getUniverseFromNameAndNamespace(cust.getId(), crUniverseName, namespace);
+    if (universe == null) {
+      throw new Exception("No universe found with name " + crUniverseName);
+    }
+    UUID universeUUID = universe.getUniverseUUID();
+    UUID customerUUID = cust.getUuid();
+    String keyspaceName = crParams.get("database").asText();
+    crParams.put("universeUUID", universeUUID.toString());
+    crParams.put("customerUUID", customerUUID.toString());
+
+    CreatePitrConfigParams createPitrConfigParams =
+        validatingFormFactory.getFormDataOrBadRequest(crParams, CreatePitrConfigParams.class);
+    createPitrConfigParams.setKubernetesResourceDetails(
+        KubernetesResourceDetails.fromResource(pitrConfig));
+    return createPitrConfigParams;
+  }
+
+  public UpdatePitrConfigParams getUpdatePitrConfigParamsFromCr(PitrConfig pitrConfig)
+      throws Exception {
+
+    ObjectNode crParams = objectMapper.valueToTree(pitrConfig.getSpec());
+    Customer cust = getOperatorCustomer();
+    String crUniverseName = crParams.get("universe").asText();
+    Universe universe = getUniverseFromNameAndNamespace(cust.getId(), crUniverseName, namespace);
+    if (universe == null) {
+      throw new Exception("No universe found with name " + crUniverseName);
+    }
+    UUID universeUUID = universe.getUniverseUUID();
+    UUID customerUUID = cust.getUuid();
+    UUID pitrConfigUUID = UUID.fromString(pitrConfig.getStatus().getResourceUUID());
+    crParams.put("universeUUID", universeUUID.toString());
+    crParams.put("customerUUID", customerUUID.toString());
+    crParams.put("pitrConfigUUID", pitrConfigUUID.toString());
+
+    UpdatePitrConfigParams updatePitrConfigParams =
+        validatingFormFactory.getFormDataOrBadRequest(crParams, UpdatePitrConfigParams.class);
+
+    updatePitrConfigParams.setKubernetesResourceDetails(
+        KubernetesResourceDetails.fromResource(pitrConfig));
+
+    return updatePitrConfigParams;
   }
 }

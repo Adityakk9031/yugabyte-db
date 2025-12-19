@@ -477,6 +477,12 @@ Status PrintYSQLWriteRequest(
   return Status::OK();
 }
 
+template <typename Req>
+std::optional<uint64_t> GetRecipientLeaseEpoch(const Req& req) {
+  return req.has_recipient_lease_epoch() ? std::optional(req.recipient_lease_epoch())
+                                         : std::nullopt;
+}
+
 } // namespace
 
 typedef ListTabletsResponsePB::StatusAndSchemaPB StatusAndSchemaPB;
@@ -559,9 +565,10 @@ class WriteQueryCompletionCallback {
     auto tablet_metrics = query_->scoped_tablet_metrics();
     auto statistics = query_->scoped_statistics();
 
-    if (auto* resp = query_->GetPgsqlResponseForMetricsCapture()) {
-      tablet_metrics.CopyToPgsqlResponse(resp);
-      statistics.CopyToPgsqlResponse(resp);
+    auto [resp_ptr, metrics_capture] = query_->GetPgsqlResponseAndMetricsCapture();
+    if (resp_ptr) {
+      tablet_metrics.CopyToPgsqlResponse(resp_ptr, metrics_capture);
+      statistics.CopyToPgsqlResponse(resp_ptr, metrics_capture);
     }
   }
 
@@ -2752,6 +2759,7 @@ void TabletServiceImpl::Read(const ReadRequestPB* req,
     return;
   }
 
+  VLOG(5) << "Read req: " << req->ShortDebugString();
   PerformRead(server_, this, req, resp, std::move(context));
 }
 
@@ -3812,6 +3820,10 @@ void TabletServiceImpl::AcquireObjectLocks(
   TRACE("Start AcquireObjectLocks");
   VLOG(2) << "Received AcquireObjectLocks RPC: " << req->DebugString();
 
+  if (auto s = CheckLocalLeaseEpoch(GetRecipientLeaseEpoch(*req)); !s.ok()) {
+    return SetupErrorAndRespond(
+        resp->mutable_error(), s, TabletServerErrorPB::INVALID_YSQL_LEASE, &context);
+  }
   auto ts_local_lock_manager = server_->ts_local_lock_manager();
   if (!ts_local_lock_manager) {
     return SetupErrorAndRespond(
@@ -3829,6 +3841,10 @@ void TabletServiceImpl::ReleaseObjectLocks(
   TRACE("Start ReleaseObjectLocks");
   VLOG(2) << "Received ReleaseObjectLocks RPC: " << req->DebugString();
 
+  if (auto s = CheckLocalLeaseEpoch(GetRecipientLeaseEpoch(*req)); !s.ok()) {
+    return SetupErrorAndRespond(
+        resp->mutable_error(), s, TabletServerErrorPB::INVALID_YSQL_LEASE, &context);
+  }
   auto ts_local_lock_manager = server_->ts_local_lock_manager();
   if (!ts_local_lock_manager) {
     resp->set_propagated_hybrid_time(server_->Clock()->Now().ToUint64());
@@ -3836,10 +3852,10 @@ void TabletServiceImpl::ReleaseObjectLocks(
         resp->mutable_error(), STATUS(IllegalState, "TSLocalLockManager not found..."), &context);
     return;
   }
-  auto s = ts_local_lock_manager->ReleaseObjectLocks(*req, context.GetClientDeadline());
+  auto res = ts_local_lock_manager->ReleaseObjectLocks(*req, context.GetClientDeadline());
   resp->set_propagated_hybrid_time(server_->Clock()->Now().ToUint64());
-  if (!s.ok()) {
-    SetupErrorAndRespond(resp->mutable_error(), s, &context);
+  if (!res.ok()) {
+    SetupErrorAndRespond(resp->mutable_error(), res.status(), &context);
   } else {
     context.RespondSuccess();
   }
@@ -3942,6 +3958,23 @@ Result<VerifyVectorIndexesResponsePB> TabletServiceImpl::VerifyVectorIndexes(
     RETURN_NOT_OK(tablet->vector_indexes().Verify());
   }
   return VerifyVectorIndexesResponsePB();
+}
+
+Status TabletServiceImpl::CheckLocalLeaseEpoch(std::optional<uint64_t> recipient_lease_epoch) {
+  if (!recipient_lease_epoch.has_value()) {
+    return Status::OK();
+  }
+  auto local_lease_info = VERIFY_RESULT(server_->GetYSQLLeaseInfo());
+  if (local_lease_info.is_live && local_lease_info.lease_epoch == *recipient_lease_epoch) {
+    return Status::OK();
+  }
+  auto msg = !local_lease_info.is_live
+                 ? "TServer does not have a live lease"
+                 : Format(
+                       "Expected lease epoch in request $0 does not match TServer's local "
+                       "lease epoch $1",
+                       *recipient_lease_epoch, local_lease_info.lease_epoch);
+  return STATUS(IllegalState, msg);
 }
 
 }  // namespace yb::tserver

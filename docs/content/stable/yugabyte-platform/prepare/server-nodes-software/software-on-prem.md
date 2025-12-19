@@ -35,7 +35,7 @@ After you have created the VMs with the operating system and additional software
 
 These steps prepare the node for use by YugabyteDB Anywhere, including setting ulimits and transparent hugepages. If you have already [installed YugabyteDB Anywhere](../../../install-yugabyte-platform/) and it is running (recommended), the script additionally creates (or updates) an [on-premises provider](../../../configure-yugabyte-platform/on-premises/) with the node already added.
 
-Root or sudo privileges are only required to provision the nodes. After the node is provisioned (with [YugabyteDB Anywhere node agent](/preview/faq/yugabyte-platform/#what-is-a-node-agent) installed), sudo is no longer required.
+Root or sudo privileges are only required to provision the nodes. After the node is provisioned (with [YugabyteDB Anywhere node agent](/stable/faq/yugabyte-platform/#what-is-a-node-agent) installed), sudo is no longer required.
 
 ### Download the package
 
@@ -109,6 +109,7 @@ The following table describes options that are changed for a typical installatio
 | `use_system_level_systemd` | Defaults to false (which uses user-level systemd for service management). |
 | `node_ip` | The fully-qualified domain name or IP address of the node you are provisioning. Must be accessible to other nodes. |
 | `tmp_directory` | The directory on the node to use for storing temporary files during provisioning. |
+| `is_configure_clockbound` | {{<tags/feature/ea idea="2133">}}Set to `true` to configure [ClockBound](https://github.com/aws/clock-bound) during provisioning. ClockBound improves clock accuracy and reduces read-restart errors in YSQL. ClockBound requires [chrony](https://chrony-project.org/) to be configured. <br/>When enabled, the provisioning script installs ClockBound as a systemd unit and configures it to communicate with chronyd. <br/>The script also configures the on-premises provider configuration (see the following options) so that universes created using the provider automatically have the [time_source](../../../../reference/configuration/yb-master/#time-source) flag set to `clockbound`. |
 
 Set the following options to have node agent create (or update) the [on-premises provider configuration](../../../configure-yugabyte-platform/on-premises-provider/) where you want to add the node. (YugabyteDB Anywhere must be installed and running.)
 
@@ -149,13 +150,19 @@ Run the script either as a root user, or via sudo as follows:
 sudo ./node-agent-provision.sh
 ```
 
-The script provisions the node and installs node agent, and then runs preflight checks to ensure the node is ready for use.
+The script provisions the node and installs node agent, and runs preflight checks to ensure the node is ready for provisioning.
 
 If specified, node agent also creates the on-premises provider configuration; or, if the provider configuration already exists, adds the instance to the provider.
 
 After the node is provisioned, reboot the node.
 
 If the preflight check fails, rebooting the node may solve some issues (for example, incorrect ulimit settings).
+
+#### Verify provisioning
+
+After running the script and rebooting the VM, you can verify that provisioning was successful and YugabyteDB Anywhere can communicate with the node by navigating to `https://<yugabytedbanywhere-host-ip>/nodeagent`, where `yugabytedbanywhere-host-ip` is the IP address hosting your YugabyteDB Anywhere instance.
+
+The page lists the node agents that have been activated and their status.
 
 #### Preflight check
 

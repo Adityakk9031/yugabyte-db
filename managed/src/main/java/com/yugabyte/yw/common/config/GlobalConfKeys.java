@@ -1771,6 +1771,14 @@ public class GlobalConfKeys extends RuntimeConfigKeysModule {
           "Cache size for node agent client connections",
           ConfDataType.IntegerType,
           ImmutableList.of(ConfKeyTags.PUBLIC));
+  public static final ConfKeyInfo<Boolean> nodeAgentIgnoreConnectionCacheSize =
+      new ConfKeyInfo<>(
+          "yb.node_agent.ignore_connection_cache_size",
+          ScopeType.GLOBAL,
+          "Ignore Node Agent Client Connection Cache Size",
+          "Ignore the cache size (limit) for node agent client connections",
+          ConfDataType.BooleanType,
+          ImmutableList.of(ConfKeyTags.PUBLIC));
   public static final ConfKeyInfo<Duration> nodeAgentConnectTimeout =
       new ConfKeyInfo<>(
           "yb.node_agent.connect_timeout",
@@ -1941,6 +1949,24 @@ public class GlobalConfKeys extends RuntimeConfigKeysModule {
           "Allow YBA Restore With Old Backup",
           "Allow YBA restore from one time restore or continuous backup when backup file is more"
               + " than 1 day old",
+          ConfDataType.BooleanType,
+          ImmutableList.of(ConfKeyTags.PUBLIC));
+  public static final ConfKeyInfo<List> accessLogExcludeRegex =
+      new ConfKeyInfo<>(
+          "yb.log.access.exclude_regex",
+          ScopeType.GLOBAL,
+          "List of 'METHOD uri' regexes to exclude from the access log",
+          "List of 'METHOD uri' regexes which we don't print in access log, like 'GET"
+              + " \\/some\\/path\\/.+",
+          ConfDataType.StringListType,
+          ImmutableList.of(ConfKeyTags.INTERNAL));
+  public static final ConfKeyInfo<Boolean> allowLocalLoginWithSso =
+      new ConfKeyInfo<>(
+          "yb.security.allow_local_login_with_sso",
+          ScopeType.GLOBAL,
+          "Allow Local Login with SSO",
+          "Allow local user login with SSO enabled. when disabled, only superAdmin can login using"
+              + " local credentials.",
           ConfDataType.BooleanType,
           ImmutableList.of(ConfKeyTags.PUBLIC));
 }

@@ -13,9 +13,11 @@ int od_compression_frontend_setup(od_client_t *client,
 				  od_config_listen_t *config,
 				  od_logger_t *logger)
 {
+	od_instance_t *instance = client->global->instance;
 #ifndef YB_GUC_SUPPORT_VIA_SHMEM
-	kiwi_var_t *compression_var =
-		yb_kiwi_vars_get(&client->vars, "compression");
+	kiwi_var_t *compression_var = yb_kiwi_vars_get(
+		&client->vars, "compression",
+		yb_od_instance_should_lowercase_guc_name(instance));
 #else
 	kiwi_var_t *compression_var =
 		kiwi_vars_get(&client->vars, KIWI_VAR_COMPRESSION);
@@ -42,7 +44,7 @@ int od_compression_frontend_setup(od_client_t *client,
 	if (msg == NULL)
 		return -1;
 
-	int rc = od_write(&client->io, msg);
+	int rc = od_write(&client->io, &msg);
 	if (rc == -1) {
 		od_error(logger, "compression", client, NULL, "write error: %s",
 			 od_io_error(&client->io));

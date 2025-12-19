@@ -165,6 +165,7 @@ static List *rewritten_table_oid_list = NIL;
 typedef struct YbNewRelMapEntry
 {
 	char	   *name;
+	char	   *namespace;
 	Oid			relfile_oid;
 	Oid			colocation_id;
 	bool		is_index;
@@ -259,6 +260,7 @@ bool
 ShouldReplicateRelationHelper(Oid rel_oid, List **new_rel_list, bool is_table_rewrite,
 							  bool include_inheritance_children)
 {
+	Oid         namespace_oid;
 	Relation	rel = RelationIdGetRelation(rel_oid);
 
 	if (!rel)
@@ -281,6 +283,8 @@ ShouldReplicateRelationHelper(Oid rel_oid, List **new_rel_list, bool is_table_re
 	YbNewRelMapEntry *new_rel_entry = palloc(sizeof(struct YbNewRelMapEntry));
 
 	new_rel_entry->name = pstrdup(RelationGetRelationName(rel));
+	namespace_oid = RelationGetNamespace(rel);
+	new_rel_entry->namespace = pstrdup(get_namespace_name(namespace_oid));
 	new_rel_entry->relfile_oid = YbGetRelfileNodeId(rel);
 	new_rel_entry->colocation_id = GetColocationIdFromRelation(&rel, is_table_rewrite);
 	new_rel_entry->is_index = IsIndex(rel);
@@ -397,13 +401,6 @@ CheckAlterColumnTypeDDL(Oid rel_oid, CollectedCommand *cmd, List **new_rel_list,
 
 			switch (subcmd->subtype)
 			{
-				case AT_AlterColumnType:
-					{
-						if (is_table_rewrite)
-							elog(ERROR, "Table Rewrite ALTER COLUMN TYPE is not "
-								 "supported\n");
-						break;
-					}
 				case AT_AddIndex:
 				case AT_ReAddIndex:
 					{
@@ -481,6 +478,7 @@ ProcessNewRelationsList(JsonbParseState *state, List **rel_list)
 
 		(void) pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
 		AddStringJsonEntry(state, "rel_name", entry->name);
+		AddStringJsonEntry(state, "rel_namespace", entry->namespace);
 		AddNumericJsonEntry(state, "relfile_oid", entry->relfile_oid);
 		if (entry->colocation_id)
 			AddNumericJsonEntry(state, "colocation_id", entry->colocation_id);
@@ -809,18 +807,6 @@ ProcessSourceEventTriggerDDLCommands(JsonbParseState *state)
 		else if (command_tag == CMDTAG_ALTER_TABLE &&
 				 list_member_oid(rewritten_table_oid_list, obj_id))
 		{
-			/*
-			 * Verify if the command is ALTER COLUMN TYPE, which is currently
-			 * unsupported.
-			 * TODO(yyan): Unblock ALTER COLUMN TYPE table rewrite after
-			 * resolving issue #24007.
-			 */
-			CollectedCommand *cmd = info->command;
-
-			CheckAlterColumnTypeDDL(obj_id, cmd, &new_rel_list,
-									 /* is_table_rewrite */ true,
-									is_temporary_object);
-
 			rewritten_table_oid_list = list_delete_oid(rewritten_table_oid_list, obj_id);
 
 			/*

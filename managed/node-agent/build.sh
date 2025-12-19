@@ -5,7 +5,8 @@ set -euo pipefail
 
 export GO111MODULE=on
 
-readonly protoc_version=21.5
+# https://protobuf.dev/support/version-support/
+readonly protoc_version=33.0
 readonly package_name='node-agent'
 readonly default_platforms=("linux/amd64" "linux/arm64")
 readonly skip_dirs=("third-party" "proto" "generated" "build" "resources" "ybops" "target" \
@@ -41,10 +42,19 @@ readonly build_os=$(to_lower "$(uname -s)")
 readonly build_arch=$(to_lower "$(uname -m)")
 
 setup_protoc() {
+    install_protoc=false
     if [ ! -f "$GOBIN"/protoc ]; then
+        install_protoc=true
+    else
+        installed_version=$("$GOBIN"/protoc --version | awk -F ' ' '{print $2}')
+        if [ "$installed_version" != "$protoc_version" ]; then
+            install_protoc=true
+        fi
+    fi
+    if [ "$install_protoc" = true ]; then
         pushd "$project_dir"
-        go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28
-        go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2
+        go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10
+        go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.0
         local release_url=https://github.com/protocolbuffers/protobuf/releases
         local protoc_os=$build_os
         if [ "$protoc_os" = "darwin" ]; then
@@ -259,7 +269,6 @@ package_for_platform() {
     cp -rf ../ynp_requirements_3.6.txt "${script_dir}"/ynp_requirements_3.6.txt
     pushd "$project_dir"
     cp -rf ../devops/roles/configure-cluster-server/templates/* "${script_dir}"/ynp/modules/provision/systemd/templates/
-    cp -rf ../devops/roles/install_mount_ephemeral_drives_script/templates/mount_ephemeral_drives.sh.j2 "${script_dir}"/ynp/modules/provision/mount_ephemeral_drives/templates/run.j2
     popd
     chmod 755 "${script_dir}"/*.sh
     chmod 755 "${bin_dir}"/*.sh

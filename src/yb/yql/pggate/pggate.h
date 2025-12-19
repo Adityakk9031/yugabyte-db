@@ -62,8 +62,10 @@
 #include "yb/yql/pggate/ybc_pggate.h"
 
 namespace yb::pggate {
-class PgSession;
+
 class PgDmlRead;
+class PgFlushDebugContext;
+class PgSession;
 
 struct PgMemctxComparator {
   using is_transparent = void;
@@ -129,6 +131,8 @@ class PgApiImpl {
 
   void ResetCatalogReadTime();
   [[nodiscard]] ReadHybridTime GetCatalogReadTime() const;
+
+  Status StartPgApi(const YbcPgInitPostgresInfo& init_postgres_info);
 
   // Initialize a session to process statements that come from the same client connection.
   void InitSession(YbcPgExecStatsState& session_stats, bool is_binary_upgrade);
@@ -445,7 +449,7 @@ class PgApiImpl {
 
   //------------------------------------------------------------------------------------------------
   // All DML statements
-  Status DmlAppendTarget(PgStatement *handle, PgExpr *expr);
+  Status DmlAppendTarget(PgStatement *handle, PgExpr *expr, bool is_for_secondary_index);
 
   Status DmlAppendQual(
       PgStatement *handle, PgExpr *expr, uint32_t serialization_version,
@@ -509,6 +513,8 @@ class PgApiImpl {
                              YbcPgExpr *col_values,
                              bool is_inclusive);
 
+  Status DmlSetMergeSortKeys(YbcPgStatement handle, int num_keys, const YbcSortKey *sort_keys);
+
   // Binding Tables: Bind the whole table in a statement.  Do not use with BindColumn.
   Status DmlBindTable(YbcPgStatement handle);
 
@@ -546,7 +552,7 @@ class PgApiImpl {
   Status StartOperationsBuffering();
   Status StopOperationsBuffering();
   void ResetOperationsBuffering();
-  Status FlushBufferedOperations(const YbcFlushDebugContext& debug_context);
+  Status FlushBufferedOperations(const PgFlushDebugContext& dbg_ctx);
   Status AdjustOperationsBuffering(int multiple = 1);
 
   //------------------------------------------------------------------------------------------------
@@ -768,6 +774,7 @@ class PgApiImpl {
 
   // Sets the specified timeout in the rpc service.
   void SetTimeout(int timeout_ms);
+  void ClearTimeout();
 
   void SetLockTimeout(int lock_timeout_ms);
 
@@ -791,7 +798,9 @@ class PgApiImpl {
 
   //------------------------------------------------------------------------------------------------
   // System Validation.
-  Status ValidatePlacement(const char *placement_info, bool check_satisfiable);
+  Status ValidatePlacements(
+      const char *live_placement_info, const char *read_placement_info,
+      bool check_satisfiable);
 
   Result<bool> CheckIfPitrActive();
 
@@ -874,6 +883,7 @@ class PgApiImpl {
   Result<int64_t> GetCronLastMinute();
 
   [[nodiscard]] YbcReadPointHandle GetCurrentReadPoint() const;
+  [[nodiscard]] YbcReadPointHandle GetMaxReadPoint() const;
   Status RestoreReadPoint(YbcReadPointHandle read_point);
   Result<YbcReadPointHandle> RegisterSnapshotReadTime(uint64_t read_time, bool use_read_time);
 

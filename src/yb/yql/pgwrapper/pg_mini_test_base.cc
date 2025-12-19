@@ -36,7 +36,6 @@ DECLARE_bool(master_auto_run_initdb);
 DECLARE_bool(ysql_disable_index_backfill);
 DECLARE_int32(client_read_write_timeout_ms);
 DECLARE_int32(history_cutoff_propagation_interval_ms);
-DECLARE_int32(pggate_rpc_timeout_secs);
 DECLARE_string(pgsql_proxy_bind_address);
 DECLARE_int32(pgsql_proxy_webserver_port);
 DECLARE_int32(timestamp_history_retention_interval_sec);
@@ -59,7 +58,6 @@ void PgMiniTestBase::SetUp() {
   EnableYSQLFlags();
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_client_read_write_timeout_ms) = 120000 * kTimeMultiplier;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_hide_pg_catalog_table_creation_logs) = true;
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_pggate_rpc_timeout_secs) = 120;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_disable_index_backfill) = true;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_num_shards_per_tserver) = 1;
 
@@ -89,7 +87,7 @@ void PgMiniTestBase::SetUp() {
 
   ASSERT_OK(cluster_->Start(ExtraTServerOptions()));
 
-  ASSERT_OK(SetupPGCallbacksAndStartPG(pg_port, kPgTsIndex, mini_cluster_opt.wait_for_pg));
+  ASSERT_OK(SetupPGCallbacksAndStartPG(pg_port, kPgTsIndex));
   DontVerifyClusterBeforeNextTearDown();
 
   ASSERT_OK(MiniClusterTestWithClient<MiniCluster>::CreateClient());
@@ -134,29 +132,7 @@ Result<PgProcessConf> PgMiniTestBase::CreatePgProcessConf(uint16_t port, size_t 
   return pg_process_conf;
 }
 
-void PgMiniTestBase::StartPgSupervisor(uint16_t pg_port, const int pg_ts_idx) {
-  ASSERT_OK(WaitForInitDb(cluster_.get()));
-
-  auto pg_process_conf = ASSERT_RESULT(CreatePgProcessConf(pg_port, pg_ts_idx));
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_pgsql_proxy_webserver_port) = cluster_->AllocateFreePort();
-
-  LOG(INFO) << "Starting PostgreSQL server listening on "
-            << pg_process_conf.listen_addresses << ":" << pg_process_conf.pg_port << ", data: "
-            << pg_process_conf.data_dir
-            << ", pgsql webserver port: " << FLAGS_pgsql_proxy_webserver_port;
-
-  auto pg_ts = cluster_->mini_tablet_server(pg_ts_idx);
-
-  BeforePgProcessStart();
-  pg_supervisor_ = std::make_unique<PgSupervisor>(pg_process_conf, pg_ts->server());
-  ASSERT_OK(pg_supervisor_->StartAndMaybePause());
-  pg_ts->SetPgServerHandlers(
-      [this] { return StartPostgres(); }, [this] { StopPostgres(); },
-      [this] { return MakeConnSettings(); });
-}
-
-Status PgMiniTestBase::SetupPGCallbacksAndStartPG(
-    uint16_t pg_port, size_t pg_ts_idx, bool wait_for_pg) {
+Status PgMiniTestBase::SetupPGCallbacksAndStartPG(uint16_t pg_port, size_t pg_ts_idx) {
   RETURN_NOT_OK(WaitForInitDb(cluster_.get()));
 
   auto pg_process_conf = VERIFY_RESULT(CreatePgProcessConf(pg_port, pg_ts_idx));
@@ -172,7 +148,7 @@ Status PgMiniTestBase::SetupPGCallbacksAndStartPG(
   pg_ts->SetPgServerHandlers(
       [this] { return StartPostgres(); }, [this] { StopPostgres(); },
       [this] { return MakeConnSettings(); });
-  return pg_ts->StartPgIfConfigured(tserver::WaitToAcceptPgConnections(wait_for_pg));
+  return pg_ts->StartPgIfConfigured();
 }
 
 Status PgMiniTestBase::RecreatePgSupervisor() {

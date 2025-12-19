@@ -323,8 +323,9 @@ stop_systemd_service() {
   sed -e 's/#\s*//g' || true)
   if [ "$EXISTING_SYSTEMD_USER_ID" -eq 0 ]; then
     if [ "$CURRENT_USER_ID" -ne 0 ]; then
-      # Current user must be root.
-      echo "SUDO access is required to stop the systemd service."
+      # Current user must be root as services are installed as root.
+      echo "SUDO access is required to stop the root-level systemd service."
+      echo "Uninstall node agent by running node-agent-installer.sh -c uninstall ... as root."
       exit 1
     fi
     run_as_super_user systemctl stop $SERVICE_NAME >/dev/null 2>&1
@@ -789,9 +790,9 @@ API_TOKEN=$(echo "$API_TOKEN" | xargs)
 NODE_AGENT_DOWNLOAD_URL="$PLATFORM_URL/api/v1/node_agents/download"
 SESSION_INFO_URL="$PLATFORM_URL/api/v1/session_info"
 if [ "$OS" = "Linux" ]; then
-  set -e
-  SE_LINUX_STATUS=$(getenforce 2>/dev/null)
   set +e
+  SE_LINUX_STATUS=$(getenforce 2>/dev/null)
+  set -e
 fi
 
 main

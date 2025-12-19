@@ -481,10 +481,9 @@ public class NodeManager extends DevopsBase {
       subCommand.add(effectiveSshUser);
     } else if (type == NodeCommandType.Manage_Otel_Collector) {
       boolean useSudo =
-          (params instanceof ManageOtelCollector.Params
-                  && ((ManageOtelCollector.Params) params).installOtelCollector)
-              || (params instanceof ManageOtelCollector.Params
-                  && ((ManageOtelCollector.Params) params).useSudo);
+          params instanceof ManageOtelCollector.Params
+              && ((ManageOtelCollector.Params) params).useSudo
+              && !provider.isManualOnprem();
       // Override the effective user for the non-sudo special case.
       String computedUser =
           type == NodeCommandType.Manage_Otel_Collector && !useSudo
@@ -1867,7 +1866,6 @@ public class NodeManager extends DevopsBase {
         CreateRootVolumes.Params crvParams = (CreateRootVolumes.Params) nodeTaskParam;
         commandArgs.add("--num_disks");
         commandArgs.add(String.valueOf(crvParams.numVolumes));
-
         if (Common.CloudType.aws.equals(userIntent.providerType)) {
           commandArgs.add("--snapshot_creation_delay");
           commandArgs.add(
@@ -2165,6 +2163,9 @@ public class NodeManager extends DevopsBase {
               commandArgs.add("--lun_indexes");
               commandArgs.add(StringUtils.join(node.cloudInfo.lun_indexes, ","));
             }
+          }
+          if (taskParam.skipAnsiblePlaybook) {
+            commandArgs.add("--skip_ansible_playbook");
           }
           break;
         }

@@ -619,6 +619,8 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
       AllowSplitTablet allow_split_tablets);
 
   void InvalidateTableCache(const YBTable& table);
+  void InvalidateTableCache(
+      const TableId& table_id, VersionedTablePartitionListPtr table_partition_list);
 
   void AddAllTabletInfo(JsonWriter* writer) const;
 
@@ -726,6 +728,8 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
                           LookupTabletRangeCallback* callback);
 
   void RefreshTablePartitions(const std::shared_ptr<YBTable>& table, StdStatusCallback callback);
+
+  void InvalidateVectorIndexes(const YBTable& indexed_table);
 
   Result<RemoteTabletPtr> ProcessTabletLocation(
       const master::TabletLocationsPB& locations, ProcessedTablesMap* processed_tables,

@@ -51,6 +51,7 @@ DECLARE_int32(xcluster_ddl_queue_max_retries_per_ddl);
 DECLARE_int64(xcluster_ddl_queue_advisory_lock_key);
 DECLARE_uint32(xcluster_consistent_wal_safe_time_frequency_ms);
 DECLARE_uint32(xcluster_max_old_schema_versions);
+DECLARE_bool(xcluster_target_manual_override);
 DECLARE_string(ysql_cron_database_name);
 DECLARE_bool(ysql_enable_packed_row);
 DECLARE_uint32(ysql_oid_cache_prefetch_size);
@@ -533,7 +534,6 @@ TEST_F(XClusterDDLReplicationTest, CreateTableWithEnum) {
     auto actual = ASSERT_RESULT(conn.FetchAllAsString("SELECT paint_color::TEXT, amount FROM t;"));
     ASSERT_EQ(expected, actual);
   }
-
 }
 
 TEST_F(XClusterDDLReplicationTest, MultistatementQuery) {
@@ -2929,8 +2929,8 @@ class XClusterDDLReplicationTableRewriteTest : public XClusterDDLReplicationTest
         GetYsqlTable(&producer_cluster_, namespace_name, /*schema_name*/ "", kBaseTableName_));
 
     // Create index on the second column.
-    ASSERT_OK(producer_conn_->ExecuteFormat("CREATE INDEX idx ON $0($1 ASC)",
-        kBaseTableName_, kColumn2Name_));
+    ASSERT_OK(producer_conn_->ExecuteFormat("CREATE INDEX $0 ON $1($2 ASC)",
+        kIndexTableName_, kBaseTableName_, kColumn2Name_));
 
     // Check number of tables in the universe replication.
     ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
@@ -2962,6 +2962,7 @@ class XClusterDDLReplicationTableRewriteTest : public XClusterDDLReplicationTest
   }
 
   const std::string kBaseTableName_ = "base_table";
+  const std::string kIndexTableName_ = "idx";
   const std::string kColumn2Name_ = "b";
   client::YBTableName producer_base_table_name_;
 };
@@ -3041,29 +3042,30 @@ TEST_F(XClusterDDLReplicationTableRewriteTest, AddColumnDefaultVolatile) {
   VerifyIndex(kColumn2Name_, /* expected_indexed */ true);
 }
 
-TEST_F(XClusterDDLReplicationTableRewriteTest, AlterTypeIsBlocked) {
+TEST_F(XClusterDDLReplicationTableRewriteTest, AlterColumnType) {
   ASSERT_OK(producer_conn_->ExecuteFormat(
       "INSERT INTO $0 SELECT i, i%2 FROM generate_series(1, 100) as i;", kBaseTableName_));
 
-  // Execute ALTER COLUMN ... TYPE table rewrite.
-  auto status = producer_conn_->ExecuteFormat(
+  // Test 1: ALTER TYPE on indexed column (triggers index recreation + reindex)
+  ASSERT_OK(producer_conn_->ExecuteFormat(
       "ALTER TABLE $0 ALTER COLUMN $1 TYPE float USING(random());",
-      kBaseTableName_, kColumn2Name_);
-  ASSERT_NOK(status);
-  ASSERT_STR_CONTAINS(status.ToString(), "Table Rewrite ALTER COLUMN TYPE is not supported");
+      kBaseTableName_, kColumn2Name_));
 
-  // Ensure the table rewrite is not processed by verifying that
-  // the table ID and column type remain unchanged.
-  auto producer_base_table_name_after_rewrite_failed = ASSERT_RESULT(
-      GetYsqlTable(&producer_cluster_, namespace_name, "", kBaseTableName_));
-  ASSERT_EQ(producer_base_table_name_.table_id(),
-      producer_base_table_name_after_rewrite_failed.table_id());
-  auto column2_type = ASSERT_RESULT(producer_conn_->FetchAllAsString(
-      Format("SELECT data_type FROM information_schema.columns WHERE table_name = '$0' "
-             "AND column_name = '$1';", kBaseTableName_, kColumn2Name_)));
-  ASSERT_EQ(column2_type, "integer");
+  ASSERT_OK(producer_conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT i, i%2 FROM generate_series(101, 200) as i;",
+      kBaseTableName_));
+  VerifyTableRewrite();
+  VerifyIndex(kColumn2Name_, /* expected_indexed */ true);
 
-  // Verify column 2 is still indexed.
+  // Test 2: ALTER TYPE on non-indexed column (reindex only)
+  ASSERT_OK(producer_conn_->ExecuteFormat(
+      "ALTER TABLE $0 ALTER COLUMN $1 TYPE float USING(random());",
+      kBaseTableName_, kKeyColumnName));
+
+  ASSERT_OK(producer_conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT i, i%2 FROM generate_series(201, 300) as i;",
+      kBaseTableName_));
+  VerifyTableRewrite();
   VerifyIndex(kColumn2Name_, /* expected_indexed */ true);
 }
 
@@ -3108,6 +3110,110 @@ TEST_F(XClusterDDLReplicationTableRewriteTest, IncrementalSafeTimeBump) {
   ASSERT_OK(producer_conn_->ExecuteFormat(
       "INSERT INTO $0 SELECT i, i%2 FROM generate_series(101, 200) as i;", kBaseTableName_));
   VerifyTableRewrite();
+}
+
+TEST_F(XClusterDDLReplicationTest, AlterColumnTypePartitioned) {
+  ASSERT_OK(SetUpClustersAndReplication());
+  auto producer_conn = ASSERT_RESULT(producer_cluster_.ConnectToDB(namespace_name));
+  const auto kPartitionedTableName = "partitioned_table";
+  const auto kPartition1Name = "partitioned_table_p1";
+  const auto kPartition2Name = "partitioned_table_p2";
+  const auto kDataColumn = "data_col";
+
+  ASSERT_OK(producer_conn.ExecuteFormat(
+      "CREATE TABLE $0 ($1 int, $2 int) PARTITION BY RANGE ($1)",
+      kPartitionedTableName, kKeyColumnName, kDataColumn));
+  ASSERT_OK(producer_conn.ExecuteFormat(
+      "CREATE TABLE $0 PARTITION OF $1 FOR VALUES FROM (0) TO (15)",
+      kPartition1Name, kPartitionedTableName));
+  ASSERT_OK(producer_conn.ExecuteFormat(
+      "CREATE TABLE $0 PARTITION OF $1 FOR VALUES FROM (15) TO (40)",
+      kPartition2Name, kPartitionedTableName));
+  ASSERT_OK(producer_conn_->ExecuteFormat(
+      "INSERT INTO $0 ($1, $2) SELECT i, random() FROM generate_series(1, 10) as i",
+      kPartitionedTableName, kKeyColumnName, kDataColumn));
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  ASSERT_OK(producer_conn.ExecuteFormat(
+      "CREATE INDEX partition_idx ON $0 ($1)", kPartitionedTableName, kDataColumn));
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+
+  // ALTER TYPE on indexed column (triggers table rewrite + index recreation)
+  ASSERT_OK(producer_conn.ExecuteFormat(
+      "ALTER TABLE $0 ALTER COLUMN $1 TYPE float USING(random())",
+      kPartitionedTableName, kDataColumn));
+  ASSERT_OK(producer_conn_->ExecuteFormat(
+      "INSERT INTO $0 ($1, $2) SELECT i, random() FROM generate_series(11, 20) as i",
+      kPartitionedTableName, kKeyColumnName, kDataColumn));
+
+  // Double the timeout as partitioned table rewrite involved multiple rewrites.
+  propagation_timeout_ = propagation_timeout_ * 2;
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+
+  // Verify replication for parent table and all partitions
+  for (const auto& table_name : {kPartitionedTableName, kPartition1Name, kPartition2Name}) {
+    auto producer_table = ASSERT_RESULT(GetProducerTable(
+        ASSERT_RESULT(GetYsqlTable(&producer_cluster_, namespace_name, "", table_name))));
+    auto consumer_table = ASSERT_RESULT(GetConsumerTable(
+        ASSERT_RESULT(GetYsqlTable(&producer_cluster_, namespace_name, "", table_name))));
+    ASSERT_OK(VerifyWrittenRecords(producer_table, consumer_table));
+  }
+
+  // ALTER TYPE on partition key should fail as it would require repartitioning existing data
+  auto status = producer_conn.ExecuteFormat(
+      "ALTER TABLE $0 ALTER COLUMN $1 TYPE bigint",
+      kPartitionedTableName, kKeyColumnName);
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(status.ToString(), "partition key");
+}
+
+TEST_F(XClusterDDLReplicationTest, AlterColumnTypeWithDependentIndex) {
+  const auto kTableName = "test_table";
+  const auto kIndexName = "test_index";
+  ASSERT_OK(SetUpClustersAndReplication());
+  auto producer_conn = ASSERT_RESULT(producer_cluster_.ConnectToDB(namespace_name));
+  ASSERT_OK(producer_conn.ExecuteFormat("CREATE TABLE $0 ($1 varchar)",
+      kTableName, kKeyColumnName));
+  ASSERT_OK(producer_conn.ExecuteFormat(
+      "INSERT INTO $0 ($1) SELECT 'row_' || i FROM generate_series(1, 100) as i",
+      kTableName, kKeyColumnName));
+  ASSERT_OK(producer_conn.ExecuteFormat(
+      "CREATE INDEX $0 ON $1 ((lower($2)))", kIndexName, kTableName, kKeyColumnName));
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+
+  // Get original index OIDs before ALTER
+  auto producer_index_oid_before = ASSERT_RESULT(producer_conn.FetchRow<pgwrapper::PGOid>(
+      Format("SELECT oid FROM pg_class WHERE relname = '$0'", kIndexName)));
+  auto consumer_conn = ASSERT_RESULT(consumer_cluster_.ConnectToDB(namespace_name));
+  auto consumer_index_oid_before = ASSERT_RESULT(consumer_conn.FetchRow<pgwrapper::PGOid>(
+      Format("SELECT oid FROM pg_class WHERE relname = '$0'", kIndexName)));
+
+  // ALTER TYPE: varchar -> text (no table rewrite, but index is dropped and recreated)
+  ASSERT_OK(producer_conn.ExecuteFormat(
+      "ALTER TABLE $0 ALTER COLUMN $1 TYPE text", kTableName, kKeyColumnName));
+
+  // Verify row counts
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  auto producer_table = ASSERT_RESULT(GetProducerTable(
+      ASSERT_RESULT(GetYsqlTable(&producer_cluster_, namespace_name, "", kTableName))));
+  auto consumer_table = ASSERT_RESULT(GetConsumerTable(
+      ASSERT_RESULT(GetYsqlTable(&producer_cluster_, namespace_name, "", kTableName))));
+  ASSERT_OK(VerifyWrittenRecords(producer_table, consumer_table));
+
+  // Verify index
+  const auto stmt = Format(
+      "SELECT COUNT(*) FROM $0 WHERE lower($1) = 'row_1'", kTableName, kKeyColumnName);
+  ASSERT_TRUE(ASSERT_RESULT(producer_conn.HasIndexScan(stmt)));
+  ASSERT_TRUE(ASSERT_RESULT(consumer_conn.HasIndexScan(stmt)));
+
+  // Get new index OIDs after ALTER
+  auto producer_index_oid_after = ASSERT_RESULT(producer_conn.FetchRow<pgwrapper::PGOid>(
+      Format("SELECT oid FROM pg_class WHERE relname = '$0'", kIndexName)));
+  auto consumer_index_oid_after = ASSERT_RESULT(consumer_conn.FetchRow<pgwrapper::PGOid>(
+      Format("SELECT oid FROM pg_class WHERE relname = '$0'", kIndexName)));
+
+  // Verify index OIDs changed (index was recreated)
+  ASSERT_NE(producer_index_oid_before, producer_index_oid_after);
+  ASSERT_NE(consumer_index_oid_before, consumer_index_oid_after);
 }
 
 TEST_F(XClusterDDLReplicationTest, BackupRestorePreservesEnumSortValue) {
@@ -3469,58 +3575,145 @@ TEST_F(XClusterDDLReplicationTest, MatViewWithPartitions) {
   ASSERT_NOK(consumer_conn_->FetchAllAsString("SELECT * FROM pmv_renamed ORDER BY b"));
 }
 
-// Validate that the user cannot run arbitrary DDLs on the target cluster when in automatic mode.
-TEST_F(XClusterDDLReplicationTest, DDLsOnTarget) {
-  ASSERT_OK(SetUpClustersAndReplication());
+class XClusterTargetBlockingTest : public XClusterDDLReplicationTest {
+ public:
+  void SetUp() override {
+    TEST_SETUP_SUPER(XClusterDDLReplicationTest);
+    ASSERT_OK(SetUpClustersAndReplication());
 
-  ASSERT_OK(producer_conn_->Execute("CREATE TABLE tbl1(a int, b text)"));
-  ASSERT_OK(producer_conn_->Execute("CREATE MATERIALIZED VIEW test_mv AS SELECT a FROM tbl1"));
-  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+    ASSERT_OK(producer_conn_->Execute("CREATE TABLE tbl1(a int, b text)"));
+    ASSERT_OK(producer_conn_->Execute("CREATE TABLE tbl2(a int, b text)"));
+    ASSERT_OK(producer_conn_->Execute("CREATE MATERIALIZED VIEW test_mv1 AS SELECT a FROM tbl1"));
+    ASSERT_OK(producer_conn_->Execute("CREATE MATERIALIZED VIEW test_mv2 AS SELECT a FROM tbl1"));
+    ASSERT_OK(producer_conn_->Execute("CREATE SEQUENCE test_sequence1"));
+    ASSERT_OK(producer_conn_->Execute("CREATE SEQUENCE test_sequence2"));
 
-  constexpr auto kExpectedErrorMsg =
-      "DDL operations are forbidden on a database that is the target of automatic mode xCluster "
-      "replication";
+    ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  }
 
+  // These should all be valid regardless of whether the preceding DDLs in this list failed.
   const std::vector<std::string> kDisallowedDDLs = {
-      "CREATE TABLE test_table (id int PRIMARY KEY, name text)",
+      "CREATE TABLE new_test_table (id int PRIMARY KEY, name text)",
       "CREATE INDEX ON tbl1 (b)",
       "ALTER TABLE tbl1 ADD COLUMN age int",
       "ALTER TABLE tbl1 ADD PRIMARY KEY (a)",
       "ALTER TABLE tbl1 DROP COLUMN b",
+      "TRUNCATE TABLE tbl1",
+      "DROP TABLE tbl2 CASCADE",
+
       "CREATE MATERIALIZED VIEW new_mv AS SELECT * FROM tbl1",
-      "REFRESH MATERIALIZED VIEW test_mv",
-      "ALTER MATERIALIZED VIEW test_mv RENAME TO test_mv_renamed",
-      "DROP MATERIALIZED VIEW IF EXISTS test_mv",
-      "DROP TABLE tbl1 CASCADE",
-      "CREATE TYPE test_type AS ENUM ('A', 'B')",
-      "CREATE SCHEMA test_schema",
-      "CREATE SEQUENCE test_sequence",
+      "REFRESH MATERIALIZED VIEW test_mv1",
+      "ALTER MATERIALIZED VIEW test_mv2 RENAME TO test_mv_renamed",
+      "DROP MATERIALIZED VIEW IF EXISTS test_mv1",
+
+      "CREATE SEQUENCE new_test_sequence",
+      "ALTER SEQUENCE test_sequence1 START WITH 10000",
+      "ALTER SEQUENCE test_sequence1 RESTART WITH 20000",
+      "DROP SEQUENCE test_sequence2",
+
+      "CREATE TYPE new_test_type AS ENUM ('A', 'B')",
+      "CREATE SCHEMA new_test_schema",
   };
+
+  // Precondition: ddl is from kDisallowedDDLs.
+  bool DdlCreatesDocdbTable(const std::string& ddl) {
+    return ddl.contains("CREATE TABLE") || ddl.contains("CREATE INDEX") ||
+           ddl.contains("ADD PRIMARY KEY") || ddl.contains("CREATE MATERIALIZED VIEW") ||
+           ddl.contains("REFRESH MATERIALIZED VIEW") || ddl.contains("TRUNCATE TABLE");
+  }
+};
+
+// Validate that the user cannot run arbitrary DDLs on the target cluster when in automatic mode.
+TEST_F(XClusterTargetBlockingTest, DdlsOnTarget) {
+  constexpr auto kExpectedErrorMsg =
+      "forbidden on a database that is the target of automatic mode xCluster "
+      "replication";
 
   for (const auto& ddl : kDisallowedDDLs) {
     LOG(INFO) << "Executing: " << ddl;
-    if (ddl.contains("CREATE INDEX")) {
+    if (ddl.contains("CREATE INDEX") || ddl.contains("TRUNCATE TABLE")) {
       // TODO(#28135): Create index creates a DocDB table before making pg catalog changes causing
-      // it to fail with a bootstrapping error.
+      // it to fail with a bootstrapping error.  Ditto for TRUNCATE TABLE.
       ASSERT_NOK(consumer_conn_->Execute(ddl));
     } else {
       ASSERT_NOK_STR_CONTAINS(consumer_conn_->Execute(ddl), kExpectedErrorMsg);
     }
   }
 
-  // With manual mode we should be able to execute DDLs except those that create new DocDB Tables.
+  // Ensure sequence-altering DDLs (including DROP) did not modify sequences_data.
+  auto sequence_next = ASSERT_RESULT(
+      producer_conn_->FetchRow<pgwrapper::PGUint64>("SELECT nextval('test_sequence1')"));
+  EXPECT_LT(sequence_next, 100);
+  EXPECT_OK(producer_conn_->FetchRow<pgwrapper::PGUint64>("SELECT nextval('test_sequence2')"));
+}
+
+// With manual mode we should be able to execute DDLs except those that create new DocDB Tables.
+TEST_F(XClusterTargetBlockingTest, DdlsOnTargetManualMode) {
   ASSERT_OK(consumer_conn_->Execute(
       "SET yb_xcluster_ddl_replication.enable_manual_ddl_replication TO TRUE"));
+
   for (const auto& ddl : kDisallowedDDLs) {
     LOG(INFO) << "Executing: " << ddl;
-    if (ddl.contains("CREATE TABLE") || ddl.contains("CREATE INDEX") ||
-        ddl.contains("ADD PRIMARY KEY") || ddl.contains("CREATE MATERIALIZED VIEW") ||
-        ddl.contains("REFRESH MATERIALIZED VIEW")) {
-      ASSERT_NOK(consumer_conn_->Execute(ddl));
+    // ALTER SEQUENCE ... RESTART cannot be run in manual mode because it tries to execute a
+    // sequence manipulation function, which cannot be overridden using manual mode (it is not
+    // passed the status of that mode).
+    if (DdlCreatesDocdbTable(ddl) || ddl.contains("RESTART")) {
+      EXPECT_NOK(consumer_conn_->Execute(ddl));
     } else {
-      ASSERT_OK(consumer_conn_->Execute(ddl));
+      EXPECT_OK(consumer_conn_->Execute(ddl));
     }
   }
+}
+
+// Using the override gflag, DDLs that do not create DocDB tables can be run on the target cluster
+// in automatic mode.
+TEST_F(XClusterTargetBlockingTest, DdlsOnTargetGflagOverride) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_xcluster_target_manual_override) = true;
+
+  for (const auto& ddl : kDisallowedDDLs) {
+    LOG(INFO) << "Executing: " << ddl;
+    if (DdlCreatesDocdbTable(ddl)) {
+      EXPECT_NOK(consumer_conn_->Execute(ddl));
+    } else {
+      EXPECT_OK(consumer_conn_->Execute(ddl));
+    }
+  }
+}
+
+TEST_F(XClusterTargetBlockingTest, SequenceBumpsOnTarget) {
+  // All sequence manipulation functions work on the source:
+  EXPECT_OK(producer_conn_->FetchRow<pgwrapper::PGUint64>("SELECT nextval('test_sequence1')"));
+  EXPECT_OK(producer_conn_->FetchRow<pgwrapper::PGUint64>("SELECT currval('test_sequence1')"));
+  EXPECT_OK(producer_conn_->FetchRow<pgwrapper::PGUint64>("SELECT lastval()"));
+  EXPECT_OK(
+      producer_conn_->FetchRow<pgwrapper::PGUint64>("SELECT setval('test_sequence1', 1, true)"));
+
+  // But non-read-only sequence manipulation functions do not work on the target:
+  ASSERT_NOK_STR_CONTAINS(
+      consumer_conn_->FetchRow<pgwrapper::PGUint64>("SELECT nextval('test_sequence1')"),
+      "Sequence manipulation functions are forbidden");
+  ASSERT_NOK_STR_CONTAINS(
+      consumer_conn_->FetchRow<pgwrapper::PGUint64>("SELECT setval('test_sequence1', 1, true)"),
+      "Sequence manipulation functions are forbidden");
+  // {curr,last}val give errors unless nextval has been successfully called in the current session
+
+  // Verify manual override works.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_xcluster_target_manual_override) = true;
+  ASSERT_OK(consumer_conn_->FetchRow<pgwrapper::PGUint64>("SELECT nextval('test_sequence1')"));
+  ASSERT_OK(
+      consumer_conn_->FetchRow<pgwrapper::PGUint64>("SELECT setval('test_sequence1', 1, true)"));
+}
+
+TEST_F(XClusterTargetBlockingTest, DmlsOnTarget) {
+  constexpr auto kExpectedErrorMsg =
+      "Data modification is forbidden on database that is the target of a transactional xCluster "
+      "replication";
+
+  auto ddl = "INSERT INTO tbl1 VALUES (1, 'foo')";
+  ASSERT_NOK_STR_CONTAINS(consumer_conn_->Execute(ddl), kExpectedErrorMsg);
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_xcluster_target_manual_override) = true;
+  ASSERT_OK(consumer_conn_->Execute(ddl));
 }
 
 // Make sure we can run ANALYZE on both clusters.

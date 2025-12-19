@@ -28,7 +28,7 @@ int yb_set_client_id(od_client_t *client, od_server_t *server)
 	int rc = 0;
 
 	/* Send `SET SESSION PARAMETER` packet. */
-	rc = od_write(&server->io, msg);
+	rc = od_write(&server->io, &msg);
 	if (rc == -1) {
 		od_debug(&instance->logger, "set client_id", client, server,
 			 "Unable to send `SET SESSION PARAMETER` packet");
@@ -83,7 +83,9 @@ int od_deploy(od_client_t *client, char *context)
 	 * a reset phase due to difference in server and client GUCs.
 	 */
 	if (instance->config.yb_optimized_session_parameters &&
-		yb_check_reset_needed(&client->vars, &server->vars)) {
+	    yb_check_reset_needed(
+		    &client->vars, &server->vars,
+		    yb_od_instance_should_lowercase_guc_name(instance))) {
 		od_debug(&instance->logger, context, client, server,
 			 "deploy: RESET ALL");
 		rc = yb_send_reset_query(server);
@@ -106,8 +108,9 @@ int od_deploy(od_client_t *client, char *context)
 	}
 	query[yb_max_query_size] = '\0';
 	int query_size;
-	query_size = kiwi_vars_cas(&client->vars, &server->vars, query,
-				   yb_max_query_size);
+	query_size = kiwi_vars_cas(
+		&client->vars, &server->vars, query, yb_max_query_size,
+		yb_od_instance_should_lowercase_guc_name(instance));
 
 	if (query_size > 0) {
 		query[query_size] = 0;
@@ -119,7 +122,7 @@ int od_deploy(od_client_t *client, char *context)
 			return -1;
 		}
 
-		rc = od_write(&server->io, msg);
+		rc = od_write(&server->io, &msg);
 		if (rc == -1) {
 			free(query);
 			return -1;

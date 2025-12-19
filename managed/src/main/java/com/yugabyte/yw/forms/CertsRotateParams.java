@@ -13,6 +13,9 @@ import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.certmgmt.CertConfigType;
 import com.yugabyte.yw.common.certmgmt.CertificateHelper;
 import com.yugabyte.yw.common.certmgmt.EncryptionInTransitUtil;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.inject.StaticInjectorHolder;
 import com.yugabyte.yw.models.CertificateInfo;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.CommonUtils;
@@ -44,6 +47,14 @@ public class CertsRotateParams extends UpgradeTaskParams {
 
   @ApiModelProperty(hidden = true)
   public CertRotationType clientRootCARotationType = CertRotationType.None;
+
+  // Transient fields to track if rootCA/clientRootCA were explicitly set to null in the request
+  // These are used to preserve null values during binding/merging
+  @com.fasterxml.jackson.annotation.JsonIgnore
+  public transient boolean rootCAExplicitlyNull = false;
+
+  @com.fasterxml.jackson.annotation.JsonIgnore
+  public transient boolean clientRootCAExplicitlyNull = false;
 
   public boolean isKubernetesUpgradeSupported() {
     return true;
@@ -81,6 +92,56 @@ public class CertsRotateParams extends UpgradeTaskParams {
     }
   }
 
+  private void verifyNonRestartUpgradeSupport(Universe universe) {
+    UserIntent userIntent = universe.getUniverseDetails().getPrimaryCluster().userIntent;
+    String softwareVersion = userIntent.ybSoftwareVersion;
+
+    // Check if YB version supports cert reload (>= 2.14.0.0-b1)
+    if (Util.compareYbVersions(softwareVersion, "2.14.0.0-b1", true) < 0) {
+      throw new PlatformServiceException(
+          Status.BAD_REQUEST,
+          "Non-restart certificate rotation is not supported for universe with software version: "
+              + softwareVersion
+              + ". Minimum required version is 2.14.0.0-b1.");
+    }
+
+    // Check if cert reload feature flag is enabled
+    if (runtimeConfGetter == null) {
+      runtimeConfGetter = StaticInjectorHolder.injector().instanceOf(RuntimeConfGetter.class);
+    }
+    boolean featureFlagEnabled = runtimeConfGetter.getGlobalConf(GlobalConfKeys.enableCertReload);
+    if (!featureFlagEnabled) {
+      throw new PlatformServiceException(
+          Status.BAD_REQUEST,
+          "Non-restart certificate rotation requires the cert reload feature to be enabled. "
+              + "Please enable the feature flag 'yb.features.cert_reload.enabled' and retry.");
+    }
+
+    // Check if universe is configured for cert reload
+    boolean universeConfigured =
+        Boolean.parseBoolean(
+            universe
+                .getConfig()
+                .getOrDefault(Universe.KEY_CERT_HOT_RELOADABLE, Boolean.FALSE.toString()));
+    if (!universeConfigured) {
+      throw new PlatformServiceException(
+          Status.BAD_REQUEST,
+          "Non-restart certificate rotation requires the universe to be configured for cert "
+              + "reload. The universe will be automatically configured during the first cert "
+              + "rotation, but for non-restart upgrades, it must be configured beforehand. "
+              + "Please perform a rolling cert rotation first to configure the universe.");
+    }
+
+    // Check if node-to-node certs are expired (non-restart upgrade cannot proceed if expired)
+    boolean n2nCertExpired = CertificateHelper.checkNode2NodeCertsExpiry(universe);
+    if (n2nCertExpired) {
+      throw new PlatformServiceException(
+          Status.BAD_REQUEST,
+          "Non-restart certificate rotation cannot be performed when node-to-node certificates "
+              + "have expired. Please use rolling or non-rolling upgrade option instead.");
+    }
+  }
+
   private void commonValidation(Universe universe) {
     UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
     UserIntent userIntent = universeDetails.getPrimaryCluster().userIntent;
@@ -113,8 +174,9 @@ public class CertsRotateParams extends UpgradeTaskParams {
     UUID currentRootCA = universeDetails.rootCA;
     UUID currentClientRootCA = universeDetails.clientRootCA;
 
+    // Validate non-restart upgrade option for non-Kubernetes universes
     if (upgradeOption == UpgradeOption.NON_RESTART_UPGRADE) {
-      throw new PlatformServiceException(Status.BAD_REQUEST, "Cert upgrade cannot be non restart.");
+      verifyNonRestartUpgradeSupport(universe);
     }
 
     // Make sure rootCA and clientRootCA respects the rootAndClientRootCASame property
@@ -368,7 +430,8 @@ public class CertsRotateParams extends UpgradeTaskParams {
     // just that it should not be different from rootCA in k8s universes
     if (clientRootCA != null && rootCA != null && !rootCA.equals(clientRootCA)) {
       throw new PlatformServiceException(
-          Status.BAD_REQUEST, "clientRootCA not applicable for Kubernetes certificate rotation.");
+          Status.BAD_REQUEST,
+          "rootCA and clientRootCA cannot be different for Kubernetes certificate rotation.");
     }
 
     if (!rootAndClientRootCASame) {

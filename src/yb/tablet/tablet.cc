@@ -264,6 +264,9 @@ DEFINE_RUNTIME_bool(tablet_exclusive_full_compaction, false,
        "scheduled and unscheduled compactions are run before the full compaction and no other "
        "compactions will get scheduled during a full compaction.");
 
+DEFINE_RUNTIME_bool(tablet_split_use_middle_user_key, true,
+       "Consider only user keys while determining middle key for tablet split");
+
 DEFINE_RUNTIME_uint32(cdcsdk_retention_barrier_no_revision_interval_secs, 120,
                      "Duration for which CDCSDK retention barriers cannot be revised from the "
                      "cdcsdk_block_barrier_revision_start_time");
@@ -313,6 +316,10 @@ DEFINE_test_flag(bool, skip_remove_intent, false,
 
 DEFINE_test_flag(bool, simulate_load_txn_for_cdc, false,
                  "If true GetMinStartHTRunningTxnsForCDCProducer returns kInvalid");
+
+DEFINE_RUNTIME_bool(advance_intents_flushed_op_id_to_match_regular, true,
+                    "If true, the flushed op id of intents db may be updated to match that of "
+                    "regular db during flushing regular db memtable");
 
 DECLARE_bool(cdc_immediate_transaction_cleanup);
 DECLARE_bool(consistent_restore);
@@ -448,9 +455,9 @@ class YSQLMetricsScope : public MetricsScope {
     }
 
     if (GetAtomicFlag(&FLAGS_ysql_analyze_dump_metrics) &&
-        metrics_capture_ == PgsqlMetricsCaptureType::PGSQL_METRICS_CAPTURE_ALL) {
-      scoped_tablet_metrics_.CopyToPgsqlResponse(&pgsql_response_);
-      scoped_docdb_statistics_.CopyToPgsqlResponse(&pgsql_response_);
+        metrics_capture_ != PgsqlMetricsCaptureType::PGSQL_METRICS_CAPTURE_NONE) {
+      scoped_tablet_metrics_.CopyToPgsqlResponse(&pgsql_response_, metrics_capture_);
+      scoped_docdb_statistics_.CopyToPgsqlResponse(&pgsql_response_, metrics_capture_);
     }
   }
 
@@ -584,6 +591,11 @@ class Tablet::RegularRocksDbListener : public Tablet::RocksDbListener {
     if (FLAGS_enable_schema_packing_gc) {
       OldSchemaGC();
     }
+  }
+
+  void OnFlushCompleted(rocksdb::DB* db, const rocksdb::FlushJobInfo& flush_job_info) override {
+    RocksDbListener::OnFlushCompleted(db, flush_job_info);
+    ERROR_NOT_OK(tablet_.MayModifyIntentsDbFlushedOpId(), log_prefix_);
   }
 
  private:
@@ -1898,7 +1910,6 @@ Status Tablet::ApplyKeyValueRowOperations(
     RETURN_NOT_OK(WriteTransactionalBatch(batch_idx, put_batch, write_hybrid_time, frontiers));
   } else {
     // See comments for PrepareExternalWriteBatch.
-
     rocksdb::WriteBatch intents_write_batch;
     docdb::NonTransactionalBatchWriter batcher(
         put_batch, write_hybrid_time, batch_hybrid_time, intents_db_.get(), &intents_write_batch,
@@ -4040,6 +4051,38 @@ void Tablet::FlushIntentsDbIfNecessary(const yb::OpId& lastest_log_entry_op_id) 
   }
 }
 
+Status Tablet::MayModifyIntentsDbFlushedOpId() {
+  auto scoped_read_operation = CreateScopedRWOperationBlockingRocksDbShutdownStart();
+  RETURN_NOT_OK(scoped_read_operation);
+  if (!intents_db_ || !regular_db_) {
+    return Status::OK();
+  }
+
+  OpId regular_op_id = docdb::MaxPersistentOpIdForDb(regular_db_.get(),
+                                                     /*invalid_if_no_new_data*/ false);
+  OpId intents_op_id = docdb::MaxPersistentOpIdForDb(intents_db_.get(),
+                                                     /*invalid_if_no_new_data*/ false);
+
+  auto intents_flush_ability = intents_db_->GetFlushAbility();
+  VLOG_WITH_PREFIX(4) << "regular_op_id: " << regular_op_id << ", intents_op_id: " << intents_op_id
+                      << ", intents_flush_ability: " << intents_flush_ability;
+
+  // We take regular frontier and intents frontier first, and intents_flush_ability last. If
+  // intents_flush_ability is kNoNewData, it means intents flushed op id can be at least advanced
+  // to match regular db.
+  if (intents_flush_ability == rocksdb::FlushAbility::kNoNewData &&
+      FLAGS_advance_intents_flushed_op_id_to_match_regular) {
+    LOG_WITH_PREFIX(INFO)
+          << "Update intents DB flushed op id from " << intents_op_id << " to " << regular_op_id;
+    docdb::ConsensusFrontier frontier;
+    frontier.set_op_id(regular_op_id);
+    RETURN_NOT_OK(intents_db_->ModifyFlushedFrontier(
+        frontier.Clone(), rocksdb::FrontierModificationMode::kUpdateIgnoreBackwards));
+  }
+
+  return Status::OK();
+}
+
 bool Tablet::IsTransactionalRequest(bool is_ysql_request) const {
   // We consider all YSQL tables within the sys catalog transactional.
   return txns_enabled_ && (
@@ -4524,7 +4567,7 @@ Result<RaftGroupMetadataPtr> Tablet::CreateSubtablet(
       tablet_id, partition, key_bounds.lower.ToStringBuffer(), key_bounds.upper.ToStringBuffer()));
 
   RETURN_NOT_OK(snapshots_->CreateCheckpoint(
-      metadata->rocksdb_dir(), CreateIntentsCheckpointIn::kSubDir));
+      metadata->rocksdb_dir(), CreateCheckpointIn::kUseSuffix));
 
   // We want flushed frontier to cover split_op_id, so during bootstrap of after-split tablets
   // we don't replay split operation.
@@ -4649,7 +4692,12 @@ Result<std::string> Tablet::GetEncodedMiddleSplitKey(std::string *partition_spli
   };
 
   // TODO(tsplit): should take key_bounds_ into account.
-  auto middle_key = VERIFY_RESULT(regular_db_->GetMiddleKey());
+  Slice lower_bound_key;
+  if (FLAGS_tablet_split_use_middle_user_key) {
+    lower_bound_key = Slice(&dockv::kMinRegularDbTableRowFirstByte, 1);
+    LOG_WITH_PREFIX(INFO) << "Middle split key lower bound: " << lower_bound_key.ToDebugHexString();
+  }
+  auto middle_key = VERIFY_RESULT(regular_db_->GetMiddleKey(lower_bound_key));
 
   // In some rare cases middle key can point to a special internal record which is not visible
   // for a user, but tablet splitting routines expect the specific structure for partition keys

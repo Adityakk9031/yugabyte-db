@@ -45,7 +45,7 @@ typedef struct {
 
 // This must be called exactly once to initialize the YB/PostgreSQL gateway API before any other
 // functions in this API are called.
-void YBCInitPgGate(
+YbcStatus YBCInitPgGate(
     YbcPgTypeEntities type_entities, const YbcPgCallbacks* pg_callbacks,
     const YbcPgInitPostgresInfo *init_postgres_info, YbcPgAshConfig* ash_config);
 
@@ -492,7 +492,8 @@ YbcStatus YBCPgWaitVectorIndexReady(
 // This function is for specifying the selected or returned expressions.
 // - SELECT target_expr1, target_expr2, ...
 // - INSERT / UPDATE / DELETE ... RETURNING target_expr1, target_expr2, ...
-YbcStatus YBCPgDmlAppendTarget(YbcPgStatement handle, YbcPgExpr target);
+YbcStatus YBCPgDmlAppendTarget(
+    YbcPgStatement handle, YbcPgExpr target, bool is_for_secondary_index);
 
 // Add a WHERE clause condition to the statement.
 // Currently only SELECT statement supports WHERE clause conditions.
@@ -574,6 +575,9 @@ YbcStatus YBCPgDmlAddRowUpperBound(YbcPgStatement handle, int n_col_values,
 YbcStatus YBCPgDmlAddRowLowerBound(YbcPgStatement handle, int n_col_values,
                                     YbcPgExpr *col_values, bool is_inclusive);
 
+YbcStatus YBCPgDmlSetMergeSortKeys(YbcPgStatement handle, int num_keys,
+                                   const YbcSortKey *sort_keys);
+
 // Binding Tables: Bind the whole table in a statement.  Do not use with BindColumn.
 YbcStatus YBCPgDmlBindTable(YbcPgStatement handle);
 
@@ -614,7 +618,7 @@ YbcStatus YBCPgBuildYBTupleId(const YbcPgYBTupleIdDescriptor* data, uint64_t *yb
 YbcStatus YBCPgStartOperationsBuffering();
 YbcStatus YBCPgStopOperationsBuffering();
 void YBCPgResetOperationsBuffering();
-YbcStatus YBCPgFlushBufferedOperations(YbcFlushDebugContext *debug_context);
+YbcStatus YBCPgFlushBufferedOperations(const YbcFlushDebugContext *debug_context);
 YbcStatus YBCPgAdjustOperationsBuffering(int multiple);
 
 YbcStatus YBCPgNewSample(const YbcPgOid database_oid,
@@ -761,7 +765,9 @@ bool YBCCurrentTransactionUsesFastPath();
 // System validation -------------------------------------------------------------------------------
 // Validate whether placement information is theoretically valid. If check_satisfiable is true,
 // also check whether the current set of tservers can satisfy the requested placement.
-YbcStatus YBCPgValidatePlacement(const char *placement_info, bool check_satisfiable);
+YbcStatus YBCPgValidatePlacements(
+    const char *live_placement_info, const char *read_placement_info,
+    bool check_satisfiable);
 
 //--------------------------------------------------------------------------------------------------
 // Expressions.
@@ -854,9 +860,12 @@ void YBCInitFlags();
 bool YBCPgIsYugaByteEnabled();
 
 // Sets the specified timeout in the rpc service.
-void YBCSetTimeout(int timeout_ms, void* extra);
+void YBCSetTimeout(int timeout_ms);
+void YBCClearTimeout();
 
 void YBCSetLockTimeout(int lock_timeout_ms, void* extra);
+
+void YBCCheckForInterrupts();
 
 //--------------------------------------------------------------------------------------------------
 // Thread-Local variables.
@@ -1001,6 +1010,7 @@ YbcStatus YBCServersMetrics(YbcPgServerMetricsInfo** serverMetricsInfo, size_t* 
 YbcStatus YBCDatabaseClones(YbcPgDatabaseCloneInfo** databaseClones, size_t* count);
 
 YbcReadPointHandle YBCPgGetCurrentReadPoint();
+YbcReadPointHandle YBCPgGetMaxReadPoint();
 YbcStatus YBCPgRestoreReadPoint(YbcReadPointHandle read_point);
 YbcStatus YBCPgRegisterSnapshotReadTime(
     uint64_t read_time, bool use_read_time, YbcReadPointHandle* handle);
@@ -1044,6 +1054,20 @@ YbcStatus YBCInitTransaction(const YbcPgInitTransactionData *data);
 YbcStatus YBCCommitTransactionIntermediate(const YbcPgInitTransactionData *data);
 
 YbcStatus YBCTriggerRelcacheInitConnection(const char* dbname);
+
+YbcFlushDebugContext YBCMakeFlushDebugContextBeginSubTxn(uint32_t id, const char *name);
+YbcFlushDebugContext YBCMakeFlushDebugContextEndSubTxn(uint32_t id);
+YbcFlushDebugContext YBCMakeFlushDebugContextGetTxnSnapshot();
+YbcFlushDebugContext YBCMakeFlushDebugContextUnbatchableStmtInSqlFunc(
+    uint64_t cmd, const char *func_name);
+YbcFlushDebugContext YBCMakeFlushDebugContextUnbatchablePlStmt(
+    const char *stmt_name, const char *func_name);
+YbcFlushDebugContext YBCMakeFlushDebugContextUnbatchableStmtInPlFunc(
+    const char *cmd_name, const char *func_name);
+YbcFlushDebugContext YBCMakeFlushDebugContextCopyBatch(
+    uint64_t tuples_processed, const char *table_name);
+YbcFlushDebugContext YBCMakeFlushDebugContextSwithToDbCatalogVersionMode(YbcPgOid db_oid);
+YbcFlushDebugContext YBCMakeFlushDebugContextEndOfTopLevelStmt();
 
 #ifdef __cplusplus
 }  // extern "C"

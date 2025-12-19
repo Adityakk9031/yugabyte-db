@@ -19,6 +19,7 @@
 #include <concepts>
 #include <initializer_list>
 #include <iterator>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -66,6 +67,7 @@
 #include "yb/yql/pggate/pg_dml_read.h"
 #include "yb/yql/pggate/pg_dml_write.h"
 #include "yb/yql/pggate/pg_explicit_row_lock_buffer.h"
+#include "yb/yql/pggate/pg_flush_debug_context.h"
 #include "yb/yql/pggate/pg_function.h"
 #include "yb/yql/pggate/pg_insert.h"
 #include "yb/yql/pggate/pg_memctx.h"
@@ -126,7 +128,8 @@ Result<PgApiImpl::MessengerHolder> BuildMessenger(
   if (FLAGS_use_node_to_node_encryption) {
     secure_context = VERIFY_RESULT(rpc::CreateSecureContext(
         FLAGS_certs_dir,
-        rpc::UseClientCerts(FLAGS_node_to_node_encryption_use_client_certificates)));
+        rpc::UseClientCerts(FLAGS_node_to_node_encryption_use_client_certificates),
+        FLAGS_pggate_cert_base_name));
   }
   return PgApiImpl::MessengerHolder{
       std::move(secure_context),
@@ -687,15 +690,19 @@ PgApiImpl::PgApiImpl(
   std::memcpy(ash_config.top_level_node_id, tserver_shared_object_->tserver_uuid(), kUuidSize);
   wait_state_ = ash::WaitStateInfo::CreateIfAshIsEnabled<ash::PgWaitStateInfo>(ash_config);
   ash::WaitStateInfo::SetCurrentWaitState(wait_state_);
+}
 
-  CHECK_OK(interrupter_->Start());
-  CHECK_OK(clock_->Init());
+Status PgApiImpl::StartPgApi(const YbcPgInitPostgresInfo& init_postgres_info) {
+  RETURN_NOT_OK(interrupter_->Start());
+  RETURN_NOT_OK(clock_->Init());
 
-  CHECK_OK(pg_client_.Start(
+  RETURN_NOT_OK(pg_client_.Start(
       proxy_cache_.get(), &messenger_holder_.messenger->scheduler(),
       *tserver_shared_object_,
       init_postgres_info.parallel_leader_session_id
           ? std::optional(*init_postgres_info.parallel_leader_session_id) : std::nullopt));
+
+  return Status::OK();
 }
 
 PgApiImpl::~PgApiImpl() {
@@ -1362,8 +1369,10 @@ Status PgApiImpl::WaitVectorIndexReady(const PgObjectId& table_id) {
 // DML Statement Support.
 //--------------------------------------------------------------------------------------------------
 
-Status PgApiImpl::DmlAppendTarget(PgStatement* handle, PgExpr* target) {
-  return VERIFY_RESULT_REF(GetStatementAs<PgDml>(handle)).AppendTarget(target);
+Status PgApiImpl::DmlAppendTarget(
+    PgStatement* handle, PgExpr* target, bool is_for_secondary_index) {
+  return VERIFY_RESULT_REF(
+      GetStatementAs<PgDml>(handle)).AppendTarget(target, is_for_secondary_index);
 }
 
 Status PgApiImpl::DmlAppendQual(
@@ -1439,6 +1448,11 @@ Status PgApiImpl::DmlBindBounds(
   return Status::OK();
 }
 
+Status PgApiImpl::DmlSetMergeSortKeys(YbcPgStatement handle, int num_keys,
+                                      const YbcSortKey *sort_keys) {
+  return VERIFY_RESULT_REF(GetStatementAs<PgDmlRead>(handle)).SetMergeSortKeys(num_keys, sort_keys);
+}
+
 Status PgApiImpl::DmlBindTable(PgStatement* handle) {
   return VERIFY_RESULT_REF(GetStatementAs<PgDml>(handle)).BindTable();
 }
@@ -1474,8 +1488,8 @@ void PgApiImpl::ResetOperationsBuffering() {
   pg_session_->ResetOperationsBuffering();
 }
 
-Status PgApiImpl::FlushBufferedOperations(const YbcFlushDebugContext& debug_context) {
-  return ResultToStatus(pg_session_->FlushBufferedOperations(debug_context));
+Status PgApiImpl::FlushBufferedOperations(const PgFlushDebugContext& dbg_ctx) {
+  return ResultToStatus(pg_session_->FlushBufferedOperations(dbg_ctx));
 }
 
 Status PgApiImpl::AdjustOperationsBuffering(int multiple) {
@@ -2028,10 +2042,9 @@ Status PgApiImpl::CommitPlainTransaction(const std::optional<PgDdlCommitInfo>& d
       IllegalState, "Expected INSERT ... ON CONFLICT buffer to be empty");
   fk_reference_cache_.Clear();
 
-  YbcFlushDebugContext debug_context;
-  debug_context.reason = YbcFlushReason::YB_COMMIT_TRANSACTION;
-  debug_context.oidarg = ddl_commit_info.has_value() ? ddl_commit_info->db_oid : kInvalidOid;
-  RETURN_NOT_OK(pg_session_->FlushBufferedOperations(debug_context));
+  RETURN_NOT_OK(pg_session_->FlushBufferedOperations(
+      PgFlushDebugContext::CommitTxn(
+        ddl_commit_info.transform([](const auto& info){ return info.db_oid; }))));
   return pg_txn_manager_->CommitPlainTransaction(ddl_commit_info);
 }
 
@@ -2075,7 +2088,7 @@ Status PgApiImpl::SetDdlStateInPlainTransaction() {
 
 Status PgApiImpl::EnterSeparateDdlTxnMode() {
   // Flush all buffered operations as ddl txn use its own transaction session.
-  RETURN_NOT_OK(pg_session_->FlushBufferedOperations(YB_ENTER_DDL_TRANSACTION_MODE));
+  RETURN_NOT_OK(pg_session_->FlushBufferedOperations(PgFlushDebugContext::EnterDdlTxnMode()));
   pg_session_->ResetHasCatalogWriteOperationsInDdlMode();
   return pg_txn_manager_->EnterSeparateDdlTxnMode();
 }
@@ -2086,7 +2099,7 @@ bool PgApiImpl::HasWriteOperationsInDdlTxnMode() const {
 
 Status PgApiImpl::ExitSeparateDdlTxnMode(PgOid db_oid, bool is_silent_modification) {
   // Flush all buffered operations as ddl txn use its own transaction session.
-  RETURN_NOT_OK(pg_session_->FlushBufferedOperations(YB_EXIT_DDL_TRANSACTION_MODE));
+  RETURN_NOT_OK(pg_session_->FlushBufferedOperations(PgFlushDebugContext::ExitDdlTxnMode()));
   RETURN_NOT_OK(pg_txn_manager_->ExitSeparateDdlTxnModeWithCommit(db_oid, is_silent_modification));
   // Next reads from catalog tables have to see changes made by the DDL transaction.
   ResetCatalogReadTime();
@@ -2100,16 +2113,13 @@ Status PgApiImpl::ClearSeparateDdlTxnMode() {
 
 Status PgApiImpl::SetActiveSubTransaction(SubTransactionId id) {
   VLOG_WITH_FUNC(4) << "id: " << id;
-  YbcFlushDebugContext debug_context;
-  debug_context.reason = YbcFlushReason::YB_ACTIVATE_SUBTRANSACTION;
-  debug_context.uintarg = id;
   // It's required that we flush all buffered operations before changing the SubTransactionMetadata
   // used by the underlying batcher and RPC logic, as this will snapshot the current
   // SubTransactionMetadata for use in construction of RPCs for already-queued operations, thereby
   // ensuring that previous operations use previous SubTransactionMetadata. If we do not flush here,
   // already queued operations may incorrectly use this newly modified SubTransactionMetadata when
   // they are eventually sent to DocDB.
-  RETURN_NOT_OK(pg_session_->FlushBufferedOperations(debug_context));
+  RETURN_NOT_OK(pg_session_->FlushBufferedOperations(PgFlushDebugContext::ActivateSubTxn(id)));
   pg_txn_manager_->SetActiveSubTransactionId(id);
   return Status::OK();
 }
@@ -2269,11 +2279,15 @@ void PgApiImpl::ClearInsertOnConflictCache(void* state) {
 //--------------------------------------------------------------------------------------------------
 
 void PgApiImpl::SetTimeout(int timeout_ms) {
-  pg_session_->SetTimeout(timeout_ms);
+  pg_session_->pg_client().SetTimeout(timeout_ms);
+}
+
+void PgApiImpl::ClearTimeout() {
+  pg_session_->pg_client().ClearTimeout();
 }
 
 void PgApiImpl::SetLockTimeout(int lock_timeout_ms) {
-  pg_session_->SetLockTimeout(lock_timeout_ms);
+  pg_session_->pg_client().SetLockTimeout(lock_timeout_ms);
 }
 
 Result<yb::tserver::PgGetLockStatusResponsePB> PgApiImpl::GetLockStatusData(
@@ -2293,8 +2307,13 @@ Status PgApiImpl::GetIndexBackfillProgress(std::vector<PgObjectId> oids,
                                                num_rows_backfilled);
 }
 
-Status PgApiImpl::ValidatePlacement(const char *placement_info, bool check_satisfiable) {
-  return pg_session_->ValidatePlacement(placement_info, check_satisfiable);
+Status PgApiImpl::ValidatePlacements(
+    const char *live_placement_info, const char *read_replica_placement_info,
+    bool check_satisfiable) {
+  return pg_session_->ValidatePlacements(
+      live_placement_info ? std::string(live_placement_info) : std::string(),
+      read_replica_placement_info ? std::string(read_replica_placement_info) : std::string(),
+      check_satisfiable);
 }
 
 void PgApiImpl::StartSysTablePrefetching(const PrefetcherOptions& options) {
@@ -2464,11 +2483,12 @@ YbcReadPointHandle PgApiImpl::GetCurrentReadPoint() const {
   return pg_txn_manager_->GetCurrentReadPoint();
 }
 
+YbcReadPointHandle PgApiImpl::GetMaxReadPoint() const {
+  return pg_txn_manager_->GetMaxReadPoint();
+}
+
 Status PgApiImpl::RestoreReadPoint(YbcReadPointHandle read_point) {
-  YbcFlushDebugContext debug_context;
-  debug_context.reason = YbcFlushReason::YB_CHANGE_TRANSACTION_SNAPSHOT;
-  debug_context.uintarg = read_point;
-  RETURN_NOT_OK(FlushBufferedOperations(debug_context));
+  RETURN_NOT_OK(FlushBufferedOperations(PgFlushDebugContext::ChangeTxnSnapshot(read_point)));
   return pg_txn_manager_->RestoreReadPoint(read_point);
 }
 
@@ -2512,21 +2532,16 @@ Status PgApiImpl::AcquireObjectLock(const YbcObjectLockId& lock_id, YbcObjectLoc
 
 Result<std::string> PgApiImpl::ExportSnapshot(
     const YbcPgTxnSnapshot& snapshot, std::optional<YbcReadPointHandle> explicit_read_time) {
-  YbcFlushDebugContext debug_context;
-  debug_context.reason = YbcFlushReason::YB_EXPORT_SNAPSHOT;
-  debug_context.uintarg = explicit_read_time.has_value() ? *explicit_read_time : 0;
-  debug_context.oidarg = snapshot.db_id;
   return pg_txn_manager_->ExportSnapshot(
-      VERIFY_RESULT(pg_session_->FlushBufferedOperations(debug_context)), snapshot,
-          explicit_read_time);
+      VERIFY_RESULT(pg_session_->FlushBufferedOperations(
+          PgFlushDebugContext::ExportSnapshot(snapshot.db_id, explicit_read_time))),
+      snapshot, explicit_read_time);
 }
 
 Result<YbcPgTxnSnapshot> PgApiImpl::ImportSnapshot(std::string_view snapshot_id) {
-  YbcFlushDebugContext debug_context;
-  debug_context.reason = YbcFlushReason::YB_IMPORT_SNAPSHOT;
-  debug_context.strarg1 = snapshot_id.data();
   return pg_txn_manager_->ImportSnapshot(
-      VERIFY_RESULT(pg_session_->FlushBufferedOperations(debug_context)), snapshot_id);
+      VERIFY_RESULT(pg_session_->FlushBufferedOperations(
+          PgFlushDebugContext::ImportSnapshot(snapshot_id))), snapshot_id);
 }
 
 bool PgApiImpl::HasExportedSnapshots() const { return pg_txn_manager_->has_exported_snapshots(); }
