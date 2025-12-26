@@ -78,6 +78,12 @@ const MonoDelta kTimeout = 60s * kTimeMultiplier;
 
 class XClusterDDLReplicationTest : public XClusterDDLReplicationTestBase {
  public:
+  void SetUp() override {
+    TEST_SETUP_SUPER(XClusterDDLReplicationTestBase);
+    // DDLs need to to be processed sequentially, so increase the timeout.
+    propagation_timeout_ *= 2;
+  }
+
   Status SetUpClustersAndCheckpointReplicationGroup(
       const SetupParams& params = XClusterDDLReplicationTestBase::kDefaultParams) {
     RETURN_NOT_OK(SetUpClusters(params));
@@ -536,6 +542,67 @@ TEST_F(XClusterDDLReplicationTest, CreateTableWithEnum) {
   }
 }
 
+TEST_F(XClusterDDLReplicationTest, CreateTableWithPartitions) {
+  ASSERT_OK(SetUpClustersAndReplication());
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_xcluster_ddl_queue_handler_fail_at_start) = true;
+
+  ASSERT_OK(producer_conn_->Execute(R"(
+    CREATE TABLE table_name (
+        emp_id INT,
+        hire_date DATE,
+        region TEXT,
+        dept_id INT,
+        PRIMARY KEY (emp_id, hire_date, region),
+        UNIQUE (dept_id, emp_id, hire_date, region)
+    ) PARTITION BY HASH (emp_id);
+    CREATE TABLE table_name_p0 PARTITION OF table_name
+        FOR VALUES WITH (modulus 2, remainder 0);
+    CREATE TABLE table_name_p1 PARTITION OF table_name
+        FOR VALUES WITH (modulus 2, remainder 1);
+
+    DROP TABLE table_name CASCADE;
+  )"));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_xcluster_ddl_queue_handler_fail_at_start) = false;
+
+  // Allow extra time for the DDLs to replicate now.
+  propagation_timeout_ += MonoDelta::FromSeconds(60 * kTimeMultiplier);
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow({namespace_name}));
+}
+
+TEST_F(XClusterDDLReplicationTest, CreateIndexWithPartitions) {
+  ASSERT_OK(SetUpClustersAndReplication());
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_xcluster_ddl_queue_handler_fail_at_start) = true;
+
+  ASSERT_OK(producer_conn_->Execute(R"(
+    CREATE TABLE table_name (
+        emp_id INT,
+        hire_date DATE,
+        region TEXT,
+        dept_id INT,
+        PRIMARY KEY (emp_id, hire_date, region)
+    ) PARTITION BY HASH (emp_id);
+    CREATE TABLE table_name_p0 PARTITION OF table_name
+        FOR VALUES WITH (modulus 2, remainder 0);
+    CREATE TABLE table_name_p1 PARTITION OF table_name
+        FOR VALUES WITH (modulus 2, remainder 1);
+
+    CREATE INDEX table_name_emp_hire_region_idx
+        ON table_name (emp_id, hire_date, region);
+
+    DROP INDEX table_name_emp_hire_region_idx;
+    DROP TABLE table_name CASCADE;
+  )"));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_xcluster_ddl_queue_handler_fail_at_start) = false;
+
+  // Allow extra time for the DDLs to replicate now.
+  propagation_timeout_ += MonoDelta::FromSeconds(60 * kTimeMultiplier);
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow({namespace_name}));
+}
+
 TEST_F(XClusterDDLReplicationTest, MultistatementQuery) {
   ASSERT_OK(SetUpClustersAndReplication());
 
@@ -881,14 +948,11 @@ TEST_F(XClusterDDLReplicationTest, FailAsyncInsertPackedSchema) {
   }
   // After the stepdown, the first tablet should try to rerun InsertPackedSchemaForXClusterTarget.
 
-  // Ensure that we don't get a FATAL.
-  ASSERT_NOK(WaitForSafeTimeToAdvanceToNow());
+  // We should still be able to eventually make progress.
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
   LOG(INFO) << "SELECT result: "
             << ASSERT_RESULT(consumer_conn_->FetchAllAsString("SELECT * FROM test_table_1"));
-
-  // TODO(#28326): replace this with VerifyWrittenRecords.
-  // ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
-  // ASSERT_OK(VerifyWrittenRecords({"test_table_1"}));
+  ASSERT_OK(VerifyWrittenRecords(std::vector<TableName>{"test_table_1"}));
 }
 
 TEST_F(XClusterDDLReplicationTest, PauseTargetOnRepeatedFailures) {
@@ -991,7 +1055,6 @@ TEST_F(XClusterDDLReplicationTest, RepeatedCreateAndDropTable) {
   // Resume replication.
   ASSERT_OK(ToggleUniverseReplication(
       consumer_cluster(), consumer_client(), kReplicationGroupId, true /* is_enabled */));
-  propagation_timeout_ = propagation_timeout_ * 2;
   ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
 
   // Ensure table has the correct row at the end.
@@ -1480,7 +1543,6 @@ TEST_F(XClusterDDLReplicationTest, IncrementalSafeTimeBumpWithDdlQueueStepdowns)
 
   // Unpause replication.
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_xcluster_ddl_queue_handler_fail_at_start) = false;
-  propagation_timeout_ = propagation_timeout_ * 2;  // Give time to process the batch of DDLs.
   ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
 
   // Verify row counts.
@@ -3145,8 +3207,6 @@ TEST_F(XClusterDDLReplicationTest, AlterColumnTypePartitioned) {
       "INSERT INTO $0 ($1, $2) SELECT i, random() FROM generate_series(11, 20) as i",
       kPartitionedTableName, kKeyColumnName, kDataColumn));
 
-  // Double the timeout as partitioned table rewrite involved multiple rewrites.
-  propagation_timeout_ = propagation_timeout_ * 2;
   ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
 
   // Verify replication for parent table and all partitions
@@ -4024,6 +4084,82 @@ TEST_F(XClusterDDLReplicationTest, FuncWithDDLsAndDMLs) {
   ASSERT_OK(producer_conn_->FetchAllAsString("SELECT create_and_insert_table('test_table');"));
   ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
   ASSERT_OK(VerifyWrittenRecords(std::vector<TableName>{"test_table"}));
+}
+
+TEST_F(XClusterDDLReplicationTest, AvoidOldCompatibleConsumerSchemaVersion) {
+  // Test that we don't use an older consumer schema version if it is at risk of being GC-ed
+  // (even if it is compatible).
+
+  // Force us to quickly run out of stored schema versions.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_xcluster_max_old_schema_versions) = 2;
+
+  ASSERT_OK(SetUpClustersAndCheckpointReplicationGroup());
+  ASSERT_OK(CreateReplicationFromCheckpoint());
+
+  // Start with an initial schema, we will return to this schema later.
+  ASSERT_OK(producer_conn_->Execute("CREATE TABLE tbl1(key int primary key)"));
+  ASSERT_OK(producer_conn_->Execute("INSERT INTO tbl1 SELECT i FROM generate_series(1, 100) as i"));
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  ASSERT_OK(VerifyWrittenRecords(std::vector<TableName>{"tbl1"}));
+
+  auto producer_table =
+      ASSERT_RESULT(GetYsqlTable(&producer_cluster_, namespace_name, /*schema_name=*/"", "tbl1"));
+  auto stream_id = ASSERT_RESULT(GetCDCStreamID(producer_table.table_id()));
+
+  auto get_stream_entry = [&]() -> Result<cdc::StreamEntryPB> {
+    auto producer_map =
+        VERIFY_RESULT(GetClusterConfig(consumer_cluster_)).consumer_registry().producer_map();
+    auto stream_map = producer_map.at(kReplicationGroupId.ToString()).stream_map();
+    return stream_map.at(stream_id.ToString());
+  };
+  auto get_min_consumer_schema_version =
+      [&](const cdc::StreamEntryPB& stream_entry) -> Result<SchemaVersion> {
+    auto min_version = stream_entry.schema_versions().current_consumer_schema_version();
+    for (const auto& old_version : stream_entry.schema_versions().old_consumer_schema_versions()) {
+      min_version = std::min(min_version, old_version);
+    }
+    return min_version;
+  };
+  LOG(INFO) << "Original stream entry: " << ASSERT_RESULT(get_stream_entry()).DebugString();
+
+  // Add some columns to increase the schema versions.
+  for (int i = 0; i < 4; i++) {
+    ASSERT_OK(producer_conn_->Execute(Format("ALTER TABLE tbl1 ADD COLUMN a$0 int", i)));
+    ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  }
+  ASSERT_OK(producer_conn_->Execute(
+      Format("INSERT INTO tbl1 SELECT i,i,i FROM generate_series(101, 200) as i")));
+  ASSERT_OK(VerifyWrittenRecords(std::vector<TableName>{"tbl1"}));
+
+  auto stream_entry_after_adds = ASSERT_RESULT(get_stream_entry());
+  LOG(INFO) << "Stream entry after adding columns: " << stream_entry_after_adds.DebugString();
+  auto min_consumer_schema_version_after_adds =
+      ASSERT_RESULT(get_min_consumer_schema_version(stream_entry_after_adds));
+
+  // Return table to the original schema by dropping columns.
+  for (int i = 0; i < 4; i++) {
+    ASSERT_OK(producer_conn_->Execute(Format("ALTER TABLE tbl1 DROP COLUMN a$0", i)));
+    ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  }
+  ASSERT_OK(producer_conn_->Execute(
+      Format("INSERT INTO tbl1 SELECT i FROM generate_series(201, 300) as i")));
+  ASSERT_OK(VerifyWrittenRecords(std::vector<TableName>{"tbl1"}));
+
+  // Table should now have the original schema again, however since that compatible consumer schema
+  // version is no longer in the producer->consumer schema map, we should not use the old compatible
+  // consumer schema version.
+
+  auto stream_entry_after_drops = ASSERT_RESULT(get_stream_entry());
+  LOG(INFO) << "Stream entry after dropping columns: " << stream_entry_after_drops.DebugString();
+  auto min_consumer_schema_version_after_drops =
+      ASSERT_RESULT(get_min_consumer_schema_version(stream_entry_after_drops));
+  LOG(INFO) << "Min schema version after adds: " << min_consumer_schema_version_after_adds
+            << ", Min schema version after drops: " << min_consumer_schema_version_after_drops;
+
+  // Verify that the schema version we use for the original schema now is greater than the previous
+  // min schema version. Since the min schema version is used for schema GC, using any value lower
+  // than a previous min schema version could result in it already having been GC-ed.
+  ASSERT_GT(min_consumer_schema_version_after_drops, min_consumer_schema_version_after_adds);
 }
 
 }  // namespace yb

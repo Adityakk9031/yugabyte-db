@@ -614,7 +614,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   // Lookup tablet by ID, then call GetTabletLocations below.
   Status GetTabletLocations(
-      const TabletId& tablet_id,
+      TabletIdView tablet_id,
       TabletLocationsPB* locs_pb,
       IncludeHidden include_hidden) override;
 
@@ -630,7 +630,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       IncludeHidden include_hidden) override;
 
   // Returns the system tablet in catalog manager by the id.
-  Result<std::shared_ptr<tablet::AbstractTablet>> GetSystemTablet(const TabletId& id) override;
+  Result<std::shared_ptr<tablet::AbstractTablet>> GetSystemTablet(TabletIdView id) override;
 
   // Send the "delete tablet request" to the specified TS/tablet.
   // The specified 'reason' will be logged on the TS.
@@ -1118,6 +1118,9 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   Result<scoped_refptr<TableInfo>> FindTableByIdUnlocked(
       const TableId& table_id, bool include_deleted = true) const REQUIRES_SHARED(mutex_);
 
+  Result<bool> HasTableWithColocationId(
+      const TablegroupId& tablegroup_id, ColocationId colocation_id) const EXCLUDES(mutex_);
+
   Result<TableId> GetColocatedTableId(
       const TablegroupId& tablegroup_id, ColocationId colocation_id) const EXCLUDES(mutex_);
 
@@ -1210,6 +1213,10 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const DdlLogRequestPB* req, DdlLogResponsePB* resp, rpc::RpcContext* rpc);
 
   // Test wrapper around protected DoSplitTablet method.
+  Status TEST_SplitTablet(
+      const TabletInfoPtr& source_tablet_info,
+    const std::vector<docdb::DocKeyHash>& split_hash_codes) override;
+
   Status TEST_SplitTablet(
       const TabletInfoPtr& source_tablet_info,
       docdb::DocKeyHash split_hash_code) override;
@@ -1526,6 +1533,15 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const UpdateConsumerOnProducerMetadataRequestPB* req,
       UpdateConsumerOnProducerMetadataResponsePB* resp, rpc::RpcContext* rpc);
 
+  // If check_min_consumer_schema_version istrue, will also validate that the provided consumer
+  // schema version is >= to the minimum consumer schema version in the mapping (to ensure it hasn't
+  // been GC-ed).
+  Status DoUpdateConsumerOnProducerMetadata(
+      const xcluster::ReplicationGroupId& replication_group_id, const xrepl::StreamId& stream_id,
+      SchemaVersion producer_schema_version, SchemaVersion consumer_schema_version,
+      ColocationId colocation_id, bool check_min_consumer_schema_version,
+      UpdateConsumerOnProducerMetadataResponsePB* resp);
+
   // Store packing schemas for upcoming colocated tables on an xCluster automatic mode target,
   // since their rows are replicated before the corresponding table is created.
   Status InsertHistoricalColocatedSchemaPacking(
@@ -1703,7 +1719,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   Status BackfillMetadataForXRepl(const TableInfoPtr& table_info, const LeaderEpoch& epoch);
 
-  Result<TabletInfoPtr> GetTabletInfo(const TabletId& tablet_id) override EXCLUDES(mutex_);
+  Result<TabletInfoPtr> GetTabletInfo(TabletIdView tablet_id) override EXCLUDES(mutex_);
 
   // Gets the tablet info for each tablet id, or nullptr if the tablet was not found.
   TabletInfos GetTabletInfos(const std::vector<TabletId>& ids) override;
@@ -2203,17 +2219,18 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   // partitions_vtable_cache_refresh_secs seconds.
   void RebuildYQLSystemPartitions();
 
-  Result<TabletInfoPtr> GetTabletInfoUnlocked(const TabletId& tablet_id)
-      REQUIRES_SHARED(mutex_);
+  Result<TabletInfoPtr> GetTabletInfoUnlocked(TabletIdView tablet_id) REQUIRES_SHARED(mutex_);
 
   Status DoSplitTablet(
-      const TabletInfoPtr& source_tablet_info, std::string split_encoded_key,
-      std::string split_partition_key, ManualSplit is_manual_split, const LeaderEpoch& epoch);
+      const TabletInfoPtr& source_tablet_info, const std::vector<std::string>& split_encoded_keys,
+      const std::vector<std::string>& split_partition_keys, ManualSplit is_manual_split,
+      const LeaderEpoch& epoch);
 
   // Splits tablet using specified split_hash_code as a split point.
   Status DoSplitTablet(
-      const TabletInfoPtr& source_tablet_info, docdb::DocKeyHash split_hash_code,
-      ManualSplit is_manual_split, const LeaderEpoch& epoch);
+      const TabletInfoPtr& source_tablet_info,
+      const std::vector<docdb::DocKeyHash>& split_hash_codes, ManualSplit is_manual_split,
+      const LeaderEpoch& epoch);
 
   int64_t leader_ready_term() const override {
     return leader_ready_term_.load();
@@ -2331,7 +2348,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   // issuing a DeleteTablet call to tservers. It is possible in the case of corrupted sys catalog or
   // tservers heartbeating into wrong clusters that live data is considered to be orphaned. So make
   // sure that the tablet was explicitly deleted before deleting any on-disk data from tservers.
-  std::unordered_set<TabletId> deleted_tablets_ GUARDED_BY(mutex_);
+  UnorderedStringSet<TabletId> deleted_tablets_ GUARDED_BY(mutex_);
 
   // Split parent tablets that are now hidden and still being replicated by some CDC stream. Keep
   // track of these tablets until their children tablets start being polled, at which point they
@@ -2472,7 +2489,8 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   Status UpdateMastersListInMemoryAndDisk();
 
   // Tablets of system tables on the master indexed by the tablet id.
-  std::unordered_map<std::string, std::shared_ptr<tablet::AbstractTablet>> system_tablets_;
+  using SystemTablets = UnorderedStringMap<TabletId, std::shared_ptr<tablet::AbstractTablet>>;
+  SystemTablets system_tablets_;
 
   // Tablet of colocated databases indexed by the namespace id.
   std::unordered_map<NamespaceId, TabletInfoPtr> colocated_db_tablets_map_

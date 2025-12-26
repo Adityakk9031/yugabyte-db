@@ -470,8 +470,8 @@ PgApiImpl::MessengerHolder::~MessengerHolder() = default;
 // non-async-signal-safe messenger shutdown.
 class PgApiImpl::Interrupter {
  public:
-  explicit Interrupter(rpc::Messenger* messenger)
-      : messenger_(*messenger) {
+  Interrupter(rpc::Messenger& messenger, PgClient& pg_client)
+      : messenger_(messenger), pg_client_(pg_client) {
   }
 
   ~Interrupter() {
@@ -495,8 +495,9 @@ class PgApiImpl::Interrupter {
   }
 
  private:
-  void AsyncHandler(ev::async& async, int events) { // NOLINT
+  void AsyncHandler(ev::async& async, int events) {
     messenger_.Shutdown();
+    pg_client_.Interrupt();
     loop_.break_loop();
   }
 
@@ -505,6 +506,7 @@ class PgApiImpl::Interrupter {
   }
 
   rpc::Messenger& messenger_;
+  PgClient& pg_client_;
   ev::dynamic_loop loop_;
   ev::async async_;
   scoped_refptr<yb::Thread> thread_;
@@ -653,14 +655,14 @@ PgApiImpl::PgSharedData* PgApiImpl::PgSharedDataHolder::operator->() {
 
 PgApiImpl::PgApiImpl(
     YbcPgTypeEntities type_entities, const YbcPgCallbacks& callbacks,
-    const YbcPgInitPostgresInfo& init_postgres_info, YbcPgAshConfig& ash_config)
+    const YbcPgInitPostgresInfo& init_postgres_info, YbcPgAshConfig& ash_config,
+    YbcPgExecStatsState& session_stats, bool is_binary_upgrade)
     : pg_types_(type_entities),
       metric_registry_(new MetricRegistry()),
       metric_entity_(METRIC_ENTITY_server.Instantiate(metric_registry_.get(), "yb.pggate")),
       mem_tracker_(MemTracker::CreateTracker("PostgreSQL")),
       messenger_holder_(CHECK_RESULT(BuildMessenger(
           "pggate_ybclient", FLAGS_pggate_ybclient_reactor_threads, metric_entity_, mem_tracker_))),
-      interrupter_(new Interrupter(messenger_holder_.messenger.get())),
       proxy_cache_(std::make_unique<rpc::ProxyCache>(messenger_holder_.messenger.get())),
       pg_callbacks_(callbacks),
       wait_event_watcher_(
@@ -672,6 +674,7 @@ PgApiImpl::PgApiImpl(
           *init_postgres_info.shared_data, !init_postgres_info.parallel_leader_session_id),
       pg_client_(
           wait_event_watcher_, pg_shared_data_->next_perform_op_serial_no),
+      interrupter_(new Interrupter(*messenger_holder_.messenger, pg_client_)),
       clock_(new server::HybridClock()),
       // For parallel query, multiple PgTxnManager(s) make parallel requests to pg_client_session
       // projecting as a single ysql backend. When object locking is enabled, only the leader worker
@@ -679,9 +682,11 @@ PgApiImpl::PgApiImpl(
       enable_table_locking_(
           ShouldEnableTableLocks() && !init_postgres_info.parallel_leader_session_id),
       pg_txn_manager_(new PgTxnManager(&pg_client_, clock_, pg_callbacks_, enable_table_locking_)),
-      ybctid_reader_provider_(pg_session_),
-      fk_reference_cache_(ybctid_reader_provider_, buffering_settings_),
-      explicit_row_lock_buffer_(ybctid_reader_provider_) {
+      pg_session_(make_scoped_refptr<PgSession>(
+          pg_client_, pg_txn_manager_, pg_callbacks_, session_stats, is_binary_upgrade,
+          wait_event_watcher_, buffering_settings_)),
+      fk_reference_cache_(pg_session_, buffering_settings_),
+      explicit_row_lock_buffer_(pg_session_) {
   PgBackendSetupSharedMemory();
   // This is an RCU object, but there are no concurrent updates on PG side, only on tserver, so
   // it's safe to just save the pointer.
@@ -690,19 +695,6 @@ PgApiImpl::PgApiImpl(
   std::memcpy(ash_config.top_level_node_id, tserver_shared_object_->tserver_uuid(), kUuidSize);
   wait_state_ = ash::WaitStateInfo::CreateIfAshIsEnabled<ash::PgWaitStateInfo>(ash_config);
   ash::WaitStateInfo::SetCurrentWaitState(wait_state_);
-}
-
-Status PgApiImpl::StartPgApi(const YbcPgInitPostgresInfo& init_postgres_info) {
-  RETURN_NOT_OK(interrupter_->Start());
-  RETURN_NOT_OK(clock_->Init());
-
-  RETURN_NOT_OK(pg_client_.Start(
-      proxy_cache_.get(), &messenger_holder_.messenger->scheduler(),
-      *tserver_shared_object_,
-      init_postgres_info.parallel_leader_session_id
-          ? std::optional(*init_postgres_info.parallel_leader_session_id) : std::nullopt));
-
-  return Status::OK();
 }
 
 PgApiImpl::~PgApiImpl() {
@@ -718,16 +710,6 @@ void PgApiImpl::Interrupt() {
 }
 
 //--------------------------------------------------------------------------------------------------
-
-void PgApiImpl::InitSession(YbcPgExecStatsState& session_stats, bool is_binary_upgrade) {
-  CHECK(!pg_session_);
-
-  pg_session_ = make_scoped_refptr<PgSession>(
-      pg_client_, pg_txn_manager_, pg_callbacks_, session_stats, is_binary_upgrade,
-      wait_event_watcher_, buffering_settings_);
-}
-
-uint64_t PgApiImpl::GetSessionID() const { return pg_client_.SessionID(); }
 
 Status PgApiImpl::InvalidateCache(uint64_t min_ysql_catalog_version) {
   pg_session_->InvalidateAllTablesCache(min_ysql_catalog_version);
@@ -2550,6 +2532,27 @@ void PgApiImpl::ClearExportedTxnSnapshots() { pg_txn_manager_->ClearExportedTxnS
 
 Status PgApiImpl::TriggerRelcacheInitConnection(const std::string& dbname) {
   return pg_client_.TriggerRelcacheInitConnection(dbname);
+}
+
+Status PgApiImpl::Init(std::optional<uint64_t> session_id) {
+  RETURN_NOT_OK(interrupter_->Start());
+  RETURN_NOT_OK(clock_->Init());
+  return pg_client_.Start(
+    proxy_cache_.get(), &messenger_holder_.messenger->scheduler(), *tserver_shared_object_,
+    session_id);
+}
+
+Result<std::unique_ptr<PgApiImpl>> PgApiImpl::Make(
+      YbcPgTypeEntities type_entities, const YbcPgCallbacks& pg_callbacks,
+      const YbcPgInitPostgresInfo& init_postgres_info, YbcPgAshConfig& ash_config,
+      YbcPgExecStatsState& session_stats, bool is_binary_upgrade) {
+    std::unique_ptr<PgApiImpl> result{new PgApiImpl(
+        type_entities, pg_callbacks, init_postgres_info, ash_config, session_stats,
+        is_binary_upgrade)};
+    RETURN_NOT_OK(result->Init(
+      init_postgres_info.parallel_leader_session_id
+          ? std::optional(*init_postgres_info.parallel_leader_session_id) : std::nullopt));
+    return result;
 }
 
 } // namespace yb::pggate
